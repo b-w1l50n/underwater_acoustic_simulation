@@ -1,0 +1,2 @@
+experiment,trials,duration_s,collision_threshold_m,safe_separation_m,cruise_speed_knots,collision_free_rate,collision_free_ci_low,collision_free_ci_high,mean_min_separation_m,p05_min_separation_m,p10_min_separation_m,p90_min_separation_m,mean_gossip_delivery_rate,mean_peer_age_s,operator_to_drone_freq_khz,drone_to_drone_freq_khz
+collision_only_patrol,60,21600.0,8.0,10.0,3.0,0.05,0.01714919117914121,0.13700734625099836,5.077162197269188,2.2489458024151188,2.7158823355013686,7.145239239769212,0.940041435185185,0.1275816358024687,28.0,50.0
