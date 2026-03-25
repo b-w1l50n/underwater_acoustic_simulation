@@ -17,6 +17,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 
 
 SEED = 17
@@ -40,12 +42,16 @@ CRUISE_SPEED_MPS = 3.0 * KNOT_TO_MPS
 MAX_ACCEL_MPS2 = 0.20
 WAYPOINT_HIT_RADIUS_M = 10.0
 COLLISION_RADIUS_M = 8.0
-SAFE_SEPARATION_M = 10.0
+SAFE_SEPARATION_M = 12.0
 AVOIDANCE_GAIN = 5.0
+LOCAL_PROXIMITY_THRESHOLD_M = 10.0
+LOCAL_PROXIMITY_GAIN = 8.0
+DEAD_RECKONING_HORIZON_S = 12.0
 MOTION_NOISE_STD_M = 0.03
 GOSSIP_PACKET_BYTES = 32
 GOSSIP_SENDERS_PER_STEP = 5
-GOSSIP_ACCESS_MISS_PROB = 0.06
+GOSSIP_ACCESS_MISS_PROB = 0.01
+FREQUENCY_DIVERSITY_OFFSETS_KHZ = (-2.0, 2.0)
 
 DATA_RATE_BPS = 2400.0
 PREAMBLE_S = 0.08
@@ -66,6 +72,10 @@ SHADOWING_SIGMA_DB = 2.5
 BAD_FADE_PROB = 0.10
 BAD_FADE_DB_MIN = 10.0
 BAD_FADE_DB_MAX = 25.0
+NARROWBAND_FADE_PROB = 0.16
+NARROWBAND_FADE_DB_MIN = 8.0
+NARROWBAND_FADE_DB_MAX = 18.0
+NARROWBAND_FADE_WIDTH_KHZ = 1.0
 LATENCY_JITTER_MIN = 0.90
 LATENCY_JITTER_MAX = 1.30
 MISSION_SHADOW_MEAN_DB_MIN = 6.0
@@ -84,6 +94,7 @@ FORMATION_OFFSETS = np.array(
 )
 
 PATROL_START_CENTER = np.array([80.0, 0.0, 45.0])
+COLLISION_START_CENTER = np.array([540.0, 0.0, 45.0])
 MISSION_WAYPOINT_CENTERS = np.array(
     [
         [220.0, 120.0, 45.0],
@@ -95,6 +106,20 @@ MISSION_WAYPOINT_CENTERS = np.array(
 )
 PATROL_CENTERS = np.vstack([PATROL_START_CENTER, MISSION_WAYPOINT_CENTERS])
 PATROL_TARGETS = PATROL_CENTERS[:, None, :] + FORMATION_OFFSETS[None, :, :]
+COLLISION_PATROL_CENTERS = np.array(
+    [
+        [540.0, 0.0, 45.0],
+        [620.0, 20.0, 45.0],
+        [700.0, 0.0, 45.0],
+        [620.0, -20.0, 45.0],
+        [540.0, 0.0, 45.0],
+        [460.0, 20.0, 45.0],
+        [380.0, 0.0, 45.0],
+        [460.0, -20.0, 45.0],
+    ],
+    dtype=float,
+)
+COLLISION_PATROL_TARGETS = COLLISION_PATROL_CENTERS[:, None, :] + FORMATION_OFFSETS[None, :, :]
 
 
 @dataclass(frozen=True)
@@ -111,7 +136,7 @@ class AcousticEnvironment:
 @dataclass(frozen=True)
 class Mitigation:
     name: str
-    hopping_gain_db: float
+    hopping_enabled: bool
     redundancy_copies: int
     payload_scale: float
 
@@ -215,12 +240,25 @@ MISSION_ENVIRONMENT = AcousticEnvironment(
     comm_shadow_mean_db=8.0,
 )
 
-BASELINE = Mitigation(name="No mitigation", hopping_gain_db=0.0, redundancy_copies=1, payload_scale=1.0)
-MITIGATED = Mitigation(name="Frequency hopping + redundancy", hopping_gain_db=2.4, redundancy_copies=2, payload_scale=1.0)
+BASELINE = Mitigation(name="No mitigation", hopping_enabled=False, redundancy_copies=1, payload_scale=1.0)
+MITIGATED = Mitigation(name="Frequency hopping + redundancy", hopping_enabled=True, redundancy_copies=2, payload_scale=1.0)
 PACKET_PROFILES = [
     PacketProfile(name="32 B clear", packet_bytes=32, encrypted=False),
     PacketProfile(name="64 B encrypted", packet_bytes=64, encrypted=True),
 ]
+
+OPERATOR_DIVERSITY_FREQS_KHZ = tuple(OPERATOR_TO_DRONE_FREQ_KHZ + offset for offset in FREQUENCY_DIVERSITY_OFFSETS_KHZ)
+DRONE_DIVERSITY_FREQS_KHZ = tuple(DRONE_TO_DRONE_FREQ_KHZ + offset for offset in FREQUENCY_DIVERSITY_OFFSETS_KHZ)
+OPERATOR_HOP_PAIRS_KHZ = (
+    (24.0, 28.0),
+    (26.0, 30.0),
+    (28.0, 32.0),
+)
+DRONE_HOP_PAIRS_KHZ = (
+    (46.0, 50.0),
+    (48.0, 52.0),
+    (50.0, 54.0),
+)
 
 
 def clamp(x, lo, hi):
@@ -273,11 +311,7 @@ def update_swarm_beliefs(positions, velocities, belief_state, environment, mitig
 
     tx_count = 0
     success_count = 0
-    access_miss_prob = clamp(
-        GOSSIP_ACCESS_MISS_PROB / max(mitigation.redundancy_copies, 1) - 0.005 * mitigation.hopping_gain_db,
-        0.0,
-        0.30,
-    )
+    access_miss_prob = GOSSIP_ACCESS_MISS_PROB
 
     for slot_idx in range(GOSSIP_SENDERS_PER_STEP):
         sender_idx = (belief_state.next_sender_idx + slot_idx) % NUM_DRONES
@@ -310,8 +344,8 @@ def update_swarm_beliefs(positions, velocities, belief_state, environment, mitig
     return tx_count, success_count
 
 
-def init_fleet(trial_rng):
-    start = PATROL_START_CENTER + FORMATION_OFFSETS
+def init_fleet(trial_rng, start_center=PATROL_START_CENTER):
+    start = start_center + FORMATION_OFFSETS
     jitter = trial_rng.normal(0.0, [0.8, 0.8, 0.6], size=(NUM_DRONES, 3))
     positions = start + jitter
     velocities = np.zeros((NUM_DRONES, 3))
@@ -419,28 +453,72 @@ def packet_error_rate(snr_db, packet_bytes):
     return clamp(1.0 - (1.0 - ber) ** bits, 0.0, 1.0)
 
 
+def packet_copy_frequencies_khz(base_freq_khz, mitigation, trial_rng):
+    if mitigation.redundancy_copies <= 1:
+        return (base_freq_khz,)
+
+    if mitigation.hopping_enabled:
+        if math.isclose(base_freq_khz, OPERATOR_TO_DRONE_FREQ_KHZ, rel_tol=0.0, abs_tol=1e-9):
+            pair_idx = int(trial_rng.integers(len(OPERATOR_HOP_PAIRS_KHZ)))
+            return OPERATOR_HOP_PAIRS_KHZ[pair_idx]
+        if math.isclose(base_freq_khz, DRONE_TO_DRONE_FREQ_KHZ, rel_tol=0.0, abs_tol=1e-9):
+            pair_idx = int(trial_rng.integers(len(DRONE_HOP_PAIRS_KHZ)))
+            return DRONE_HOP_PAIRS_KHZ[pair_idx]
+
+    if math.isclose(base_freq_khz, OPERATOR_TO_DRONE_FREQ_KHZ, rel_tol=0.0, abs_tol=1e-9):
+        return OPERATOR_DIVERSITY_FREQS_KHZ
+    if math.isclose(base_freq_khz, DRONE_TO_DRONE_FREQ_KHZ, rel_tol=0.0, abs_tol=1e-9):
+        return DRONE_DIVERSITY_FREQS_KHZ
+    return tuple(base_freq_khz + offset for offset in FREQUENCY_DIVERSITY_OFFSETS_KHZ[: mitigation.redundancy_copies])
+
+
+def sample_narrowband_notch(base_freq_khz, trial_rng):
+    if trial_rng.random() >= NARROWBAND_FADE_PROB:
+        return None, 0.0
+
+    notch_center_khz = base_freq_khz + float(trial_rng.choice(np.array([-4.0, -2.0, 0.0, 2.0, 4.0])))
+    notch_depth_db = trial_rng.uniform(NARROWBAND_FADE_DB_MIN, NARROWBAND_FADE_DB_MAX)
+    return notch_center_khz, notch_depth_db
+
+
+def narrowband_penalty_db(copy_freq_khz, notch_center_khz, notch_depth_db):
+    if notch_center_khz is None or notch_depth_db <= 0.0:
+        return 0.0
+
+    normalized_offset = (copy_freq_khz - notch_center_khz) / max(NARROWBAND_FADE_WIDTH_KHZ, 1e-6)
+    return notch_depth_db * math.exp(-0.5 * normalized_offset * normalized_offset)
+
+
 def transmit_packet(tx_pos, rx_pos, tx_vel, rx_vel, packet_bytes, environment, mitigation, trial_rng, freq_khz):
     packet_bytes = max(8, int(round(packet_bytes * mitigation.payload_scale)))
+    copy_freqs_khz = packet_copy_frequencies_khz(freq_khz, mitigation, trial_rng)
     best_snr_db = -1e9
-    transmissions = 0
-    base_fading_db = trial_rng.normal(environment.comm_shadow_mean_db, SHADOWING_SIGMA_DB)
+    parallel_copies = len(copy_freqs_khz)
+    common_shadow_db = max(0.0, trial_rng.normal(environment.comm_shadow_mean_db, SHADOWING_SIGMA_DB))
+    wideband_bad_fade_db = 0.0
     if trial_rng.random() < BAD_FADE_PROB:
-        base_fading_db += trial_rng.uniform(BAD_FADE_DB_MIN, BAD_FADE_DB_MAX)
+        wideband_bad_fade_db = trial_rng.uniform(BAD_FADE_DB_MIN, BAD_FADE_DB_MAX)
+    notch_center_khz, notch_depth_db = sample_narrowband_notch(freq_khz, trial_rng)
+    success_latencies = []
+    last_latency_s = 0.0
 
-    for copy_idx in range(mitigation.redundancy_copies):
-        fading_db = max(0.0, base_fading_db + trial_rng.normal(0.0, 1.0))
-        effective_hopping_gain = mitigation.hopping_gain_db / (1.0 + 0.25 * copy_idx)
-        fading_db = max(0.0, fading_db - effective_hopping_gain)
-        snr_db, range_m = link_snr_db(tx_pos, rx_pos, tx_vel, rx_vel, environment, fading_db, freq_khz)
+    for copy_freq_khz in copy_freqs_khz:
+        selective_fade_db = max(0.0, trial_rng.normal(0.0, 1.1))
+        frequency_selective_db = narrowband_penalty_db(copy_freq_khz, notch_center_khz, notch_depth_db)
+        fading_db = common_shadow_db + wideband_bad_fade_db + selective_fade_db + frequency_selective_db
+        snr_db, range_m = link_snr_db(tx_pos, rx_pos, tx_vel, rx_vel, environment, fading_db, copy_freq_khz)
         per = packet_error_rate(snr_db, packet_bytes)
         latency_s = range_m / SOUND_SPEED_MPS + PREAMBLE_S + packet_bytes * 8.0 / DATA_RATE_BPS
         latency_s *= trial_rng.uniform(LATENCY_JITTER_MIN, LATENCY_JITTER_MAX)
+        last_latency_s = latency_s
         best_snr_db = max(best_snr_db, snr_db)
-        transmissions += 1
         if trial_rng.random() >= per:
-            return PacketResult(True, latency_s * transmissions, best_snr_db, transmissions)
+            success_latencies.append(latency_s)
 
-    return PacketResult(False, latency_s * transmissions, best_snr_db, transmissions)
+    if success_latencies:
+        return PacketResult(True, min(success_latencies), best_snr_db, parallel_copies)
+
+    return PacketResult(False, last_latency_s, best_snr_db, parallel_copies)
 
 
 def choose_ack_drone(positions):
@@ -480,7 +558,9 @@ def step_fleet(
 
     desired_velocities = safe_unit_rows(target_errors) * nominal_speeds[:, None] + current_vector + control_bias
 
-    pairwise_delta_xy = positions[:, None, :2] - belief_state.perceived_positions[:, :, :2]
+    prediction_age_s = np.minimum(belief_state.peer_age_s, DEAD_RECKONING_HORIZON_S)
+    predicted_peer_positions = belief_state.perceived_positions + belief_state.perceived_velocities * prediction_age_s[:, :, None]
+    pairwise_delta_xy = positions[:, None, :2] - predicted_peer_positions[:, :, :2]
     pairwise_distance_xy = np.linalg.norm(pairwise_delta_xy, axis=2)
     repulsion_mask = (pairwise_distance_xy < SAFE_SEPARATION_M) & (pairwise_distance_xy > 1e-6)
     closeness = np.where(repulsion_mask, (SAFE_SEPARATION_M - pairwise_distance_xy) / SAFE_SEPARATION_M, 0.0)
@@ -493,6 +573,26 @@ def step_fleet(
         where=pairwise_distance_xy[:, :, None] > 1e-9,
     )
     desired_velocities[:, :2] += np.sum(repulsion_dir_xy * repulsion_gain[:, :, None], axis=1)
+
+    # Last-ditch close-range sensing prevents contact while leaving nominal coordination
+    # dependent on communicated peer state.
+    true_pairwise_delta_xy = positions[:, None, :2] - positions[None, :, :2]
+    true_pairwise_distance_xy = np.linalg.norm(true_pairwise_delta_xy, axis=2)
+    local_mask = (true_pairwise_distance_xy < LOCAL_PROXIMITY_THRESHOLD_M) & (true_pairwise_distance_xy > 1e-6)
+    local_closeness = np.where(
+        local_mask,
+        (LOCAL_PROXIMITY_THRESHOLD_M - true_pairwise_distance_xy) / max(LOCAL_PROXIMITY_THRESHOLD_M - COLLISION_RADIUS_M, 1e-6),
+        0.0,
+    )
+    local_margin = np.where(local_mask, np.maximum(true_pairwise_distance_xy - COLLISION_RADIUS_M, 0.20), 1.0)
+    local_repulsion_gain = np.where(local_mask, LOCAL_PROXIMITY_GAIN * (local_closeness + 1.0 / local_margin), 0.0)
+    local_repulsion_dir_xy = np.divide(
+        true_pairwise_delta_xy,
+        np.maximum(true_pairwise_distance_xy[:, :, None], 1e-9),
+        out=np.zeros_like(true_pairwise_delta_xy),
+        where=true_pairwise_distance_xy[:, :, None] > 1e-9,
+    )
+    desired_velocities[:, :2] += np.sum(local_repulsion_dir_xy * local_repulsion_gain[:, :, None], axis=1)
 
     velocity_error = desired_velocities - velocities
     error_magnitudes = np.linalg.norm(velocity_error, axis=1)
@@ -711,23 +811,23 @@ def perform_arrival_handshake(positions, velocities, environment, mitigation, pa
     return HandshakeResult(False, total_latency_s, total_tx_count, total_success_count, MAX_HANDSHAKE_ATTEMPTS - 1, snr_samples, leader_idx)
 
 
-def run_collision_trial(trial_seed, store_track=True):
+def run_collision_trial(trial_seed, mitigation, store_track=True):
     trial_rng = np.random.default_rng(trial_seed)
-    positions, velocities, control_bias = init_fleet(trial_rng)
+    positions, velocities, control_bias = init_fleet(trial_rng, start_center=COLLISION_START_CENTER)
     belief_state = init_swarm_belief_state(positions, velocities)
     current_vector = sample_current(COLLISION_ENVIRONMENT, trial_rng)
     target_idx = 1
     min_sep = float("inf")
     collision_time_s = None
-    track_samples = [] if store_track else None
+    track_samples = [positions[:, :2].copy()] if store_track else None
     gossip_tx_count = 0
     gossip_success_count = 0
     peer_age_sum = 0.0
 
     total_steps = int(COLLISION_SIM_DURATION_S / DT)
     for step in range(total_steps):
-        center_target = PATROL_CENTERS[target_idx]
-        targets = PATROL_TARGETS[target_idx]
+        center_target = COLLISION_PATROL_CENTERS[target_idx]
+        targets = COLLISION_PATROL_TARGETS[target_idx]
         positions, velocities, step_tx_count, step_success_count, step_peer_age = step_fleet(
             positions,
             velocities,
@@ -736,7 +836,7 @@ def run_collision_trial(trial_seed, store_track=True):
             current_vector,
             center_target,
             COLLISION_ENVIRONMENT,
-            BASELINE,
+            mitigation,
             GOSSIP_PACKET_BYTES,
             trial_rng,
             station_keep=False,
@@ -752,7 +852,7 @@ def run_collision_trial(trial_seed, store_track=True):
             collision_time_s = step * DT
 
         if np.all(np.linalg.norm(positions - targets, axis=1) <= WAYPOINT_HIT_RADIUS_M):
-            target_idx = (target_idx + 1) % len(PATROL_CENTERS)
+            target_idx = (target_idx + 1) % len(COLLISION_PATROL_CENTERS)
 
     return CollisionTrialResult(
         trial_seed=trial_seed,
@@ -925,8 +1025,8 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
 
 
 def collision_trial_task(task):
-    trial_seed, store_track = task
-    return run_collision_trial(int(trial_seed), store_track=store_track)
+    trial_seed, mitigation, store_track = task
+    return run_collision_trial(int(trial_seed), mitigation, store_track=store_track)
 
 
 def mission_trial_task(task):
@@ -958,36 +1058,39 @@ def parallel_trial_map(task_func, tasks, worker_count):
 
 
 def run_collision_monte_carlo(trial_count, worker_count):
+    summary = {"trials": trial_count, "results": {}}
     seeds = rng.integers(0, 2**31 - 1, size=trial_count)
-    tasks = [(int(seed), False) for seed in seeds]
-    results = parallel_trial_map(collision_trial_task, tasks, resolve_worker_count(worker_count, len(tasks)))
-    best_seed = max(results, key=lambda result: result.min_separation_m).trial_seed
-    best_example = run_collision_trial(best_seed, store_track=True)
-    collision_flags = [result.collision_free for result in results]
-    min_separations = [result.min_separation_m for result in results]
-    gossip_delivery_rates = [result.gossip_delivery_rate for result in results]
-    peer_ages = [result.mean_peer_age_s for result in results]
-    collision_ci_low, collision_ci_high = binomial_confidence_interval(collision_flags)
-    p10_min_sep, p90_min_sep = percentile_bounds(min_separations, low=10.0, high=90.0)
-    return {
-        "trials": trial_count,
-        "collision_free_rate": float(np.mean(collision_flags)),
-        "collision_free_ci_low": collision_ci_low,
-        "collision_free_ci_high": collision_ci_high,
-        "mean_min_separation_m": float(np.mean(min_separations)),
-        "p05_min_separation_m": float(np.percentile(min_separations, 5)),
-        "p10_min_separation_m": p10_min_sep,
-        "p90_min_separation_m": p90_min_sep,
-        "mean_gossip_delivery_rate": float(np.mean(gossip_delivery_rates)),
-        "mean_peer_age_s": float(np.mean(peer_ages)),
-        "example": best_example,
-        "results": results,
-    }
+    for mitigation in [BASELINE, MITIGATED]:
+        tasks = [(int(seed), mitigation, False) for seed in seeds]
+        results = parallel_trial_map(collision_trial_task, tasks, resolve_worker_count(worker_count, len(tasks)))
+        best_seed = max(results, key=lambda result: result.min_separation_m).trial_seed
+        best_example = run_collision_trial(best_seed, mitigation, store_track=True)
+        collision_flags = [result.collision_free for result in results]
+        min_separations = [result.min_separation_m for result in results]
+        gossip_delivery_rates = [result.gossip_delivery_rate for result in results]
+        peer_ages = [result.mean_peer_age_s for result in results]
+        collision_ci_low, collision_ci_high = binomial_confidence_interval(collision_flags)
+        p10_min_sep, p90_min_sep = percentile_bounds(min_separations, low=10.0, high=90.0)
+        summary["results"][mitigation.name] = {
+            "collision_free_rate": float(np.mean(collision_flags)),
+            "collision_free_ci_low": collision_ci_low,
+            "collision_free_ci_high": collision_ci_high,
+            "mean_min_separation_m": float(np.mean(min_separations)),
+            "p05_min_separation_m": float(np.percentile(min_separations, 5)),
+            "p10_min_separation_m": p10_min_sep,
+            "p90_min_separation_m": p90_min_sep,
+            "mean_gossip_delivery_rate": float(np.mean(gossip_delivery_rates)),
+            "mean_peer_age_s": float(np.mean(peer_ages)),
+            "example": best_example,
+            "results": results,
+        }
+    return summary
 
 
 def run_operator_monte_carlo(trial_count, worker_count):
     summary = {}
     for packet_profile in PACKET_PROFILES:
+        seeds = rng.integers(0, 2**31 - 1, size=trial_count)
         summary[packet_profile.name] = {
             "trials": trial_count,
             "packet_bytes": packet_profile.packet_bytes,
@@ -995,7 +1098,6 @@ def run_operator_monte_carlo(trial_count, worker_count):
             "results": {},
         }
         for mitigation in [BASELINE, MITIGATED]:
-            seeds = rng.integers(0, 2**31 - 1, size=trial_count)
             tasks = [(int(seed), mitigation, packet_profile, False) for seed in seeds]
             results = parallel_trial_map(mission_trial_task, tasks, resolve_worker_count(worker_count, len(tasks)))
             successful_results = [result for result in results if result.success]
@@ -1068,6 +1170,12 @@ def operator_range_bounds():
     return float(np.min(ranges)), float(np.max(ranges))
 
 
+def range_bounds_for_centers(center_path):
+    stacked = center_path[:, None, :] + FORMATION_OFFSETS[None, :, :]
+    ranges = np.linalg.norm(stacked.reshape(-1, 3) - OPERATOR_POS, axis=1)
+    return float(np.min(ranges)), float(np.max(ranges))
+
+
 def percentile_bounds(values, low=10.0, high=90.0):
     array = np.asarray(values, dtype=float)
     return float(np.percentile(array, low)), float(np.percentile(array, high))
@@ -1096,6 +1204,7 @@ def save_collision_csv(summary, output_path):
             csv_file,
             fieldnames=[
                 "experiment",
+                "mitigation",
                 "trials",
                 "duration_s",
                 "collision_threshold_m",
@@ -1115,27 +1224,29 @@ def save_collision_csv(summary, output_path):
             ],
         )
         writer.writeheader()
-        writer.writerow(
-            {
-                "experiment": "collision_only_patrol",
-                "trials": summary["trials"],
-                "duration_s": COLLISION_SIM_DURATION_S,
-                "collision_threshold_m": COLLISION_RADIUS_M,
-                "safe_separation_m": SAFE_SEPARATION_M,
-                "cruise_speed_knots": CRUISE_SPEED_MPS / KNOT_TO_MPS,
-                "collision_free_rate": summary["collision_free_rate"],
-                "collision_free_ci_low": summary["collision_free_ci_low"],
-                "collision_free_ci_high": summary["collision_free_ci_high"],
-                "mean_min_separation_m": summary["mean_min_separation_m"],
-                "p05_min_separation_m": summary["p05_min_separation_m"],
-                "p10_min_separation_m": summary["p10_min_separation_m"],
-                "p90_min_separation_m": summary["p90_min_separation_m"],
-                "mean_gossip_delivery_rate": summary["mean_gossip_delivery_rate"],
-                "mean_peer_age_s": summary["mean_peer_age_s"],
-                "operator_to_drone_freq_khz": OPERATOR_TO_DRONE_FREQ_KHZ,
-                "drone_to_drone_freq_khz": DRONE_TO_DRONE_FREQ_KHZ,
-            }
-        )
+        for mitigation_name, metrics in summary["results"].items():
+            writer.writerow(
+                {
+                    "experiment": "collision_only_patrol",
+                    "mitigation": mitigation_name,
+                    "trials": summary["trials"],
+                    "duration_s": COLLISION_SIM_DURATION_S,
+                    "collision_threshold_m": COLLISION_RADIUS_M,
+                    "safe_separation_m": SAFE_SEPARATION_M,
+                    "cruise_speed_knots": CRUISE_SPEED_MPS / KNOT_TO_MPS,
+                    "collision_free_rate": metrics["collision_free_rate"],
+                    "collision_free_ci_low": metrics["collision_free_ci_low"],
+                    "collision_free_ci_high": metrics["collision_free_ci_high"],
+                    "mean_min_separation_m": metrics["mean_min_separation_m"],
+                    "p05_min_separation_m": metrics["p05_min_separation_m"],
+                    "p10_min_separation_m": metrics["p10_min_separation_m"],
+                    "p90_min_separation_m": metrics["p90_min_separation_m"],
+                    "mean_gossip_delivery_rate": metrics["mean_gossip_delivery_rate"],
+                    "mean_peer_age_s": metrics["mean_peer_age_s"],
+                    "operator_to_drone_freq_khz": OPERATOR_TO_DRONE_FREQ_KHZ,
+                    "drone_to_drone_freq_khz": DRONE_TO_DRONE_FREQ_KHZ,
+                }
+            )
 
 
 def save_mission_csv(summary, output_path):
@@ -1252,107 +1363,115 @@ def save_collision_png(summary, output_path):
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.8))
     fig.subplots_adjust(left=0.07, right=0.98, bottom=0.14, top=0.84, wspace=0.24)
 
-    collision_free_rate = summary["collision_free_rate"]
-    mean_min_sep = summary["mean_min_separation_m"]
-    p10_min_sep = summary["p10_min_separation_m"]
-    p90_min_sep = summary["p90_min_separation_m"]
-    p05_min_sep = summary["p05_min_separation_m"]
-    results = summary["results"]
-
-    ci_low = summary["collision_free_ci_low"]
-    ci_high = summary["collision_free_ci_high"]
-    lower_err = max(0.0, collision_free_rate - ci_low)
-    upper_err = max(0.0, ci_high - collision_free_rate)
+    mitigation_names = [BASELINE.name, MITIGATED.name]
+    colors = {BASELINE.name: "#4A5568", MITIGATED.name: "#2B6CB0"}
+    x = np.arange(len(mitigation_names))
+    collision_rates = [summary["results"][name]["collision_free_rate"] for name in mitigation_names]
+    lower_err = [
+        max(0.0, summary["results"][name]["collision_free_rate"] - summary["results"][name]["collision_free_ci_low"])
+        for name in mitigation_names
+    ]
+    upper_err = [
+        max(0.0, summary["results"][name]["collision_free_ci_high"] - summary["results"][name]["collision_free_rate"])
+        for name in mitigation_names
+    ]
     axes[0].bar(
-        ["Collision-free\n6h patrol"],
-        [collision_free_rate],
-        color="#2F855A",
+        x,
+        collision_rates,
+        color=[colors[name] for name in mitigation_names],
         width=0.55,
-        yerr=np.array([[lower_err], [upper_err]]),
+        yerr=np.vstack([lower_err, upper_err]),
         capsize=6,
         ecolor="#1A202C",
     )
     axes[0].set_ylim(0.0, 1.05)
+    axes[0].set_xticks(x, ["No mitigation", "Hop + redundancy"], rotation=8)
     axes[0].set_ylabel("Fraction of trials")
-    axes[0].set_title("Autonomous Fleet Collision Avoidance", pad=10)
-    axes[0].text(
-        0.03,
-        0.95,
-        f"Rate {collision_free_rate:.2f}\n95% CI [{ci_low:.2f}, {ci_high:.2f}]",
-        transform=axes[0].transAxes,
-        va="top",
-        ha="left",
-        fontsize=10,
-        bbox=dict(boxstyle="round,pad=0.28", facecolor="white", edgecolor="#CBD5E0", alpha=0.95),
-    )
+    axes[0].set_title("Collision-Free Patrol Rate", pad=10)
+    for idx, mitigation_name in enumerate(mitigation_names):
+        metrics = summary["results"][mitigation_name]
+        axes[0].text(
+            idx,
+            min(1.02, collision_rates[idx] + 0.06),
+            f"{metrics['collision_free_rate']:.2f}\n[{metrics['collision_free_ci_low']:.2f}, {metrics['collision_free_ci_high']:.2f}]",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
 
-    min_seps = np.array([result.min_separation_m for result in results], dtype=float)
-    plot_min = float(np.min(min_seps))
-    plot_max = float(np.max(min_seps))
+    all_min_seps = np.concatenate(
+        [np.array([result.min_separation_m for result in summary["results"][name]["results"]], dtype=float) for name in mitigation_names]
+    )
+    plot_min = float(np.min(all_min_seps))
+    plot_max = float(np.max(all_min_seps))
     span = max(plot_max - plot_min, 0.20)
     padding = 0.08 * span + 0.01
     view_min = plot_min - padding
     view_max = plot_max + padding
-
-    band = axes[1].axvspan(p10_min_sep, p90_min_sep, color="#90CDF4", alpha=0.32, zorder=0)
-    box = axes[1].boxplot(
-        min_seps,
-        vert=False,
-        positions=[0.55],
-        widths=0.24,
-        patch_artist=True,
-        manage_ticks=False,
-        boxprops=dict(facecolor="#BEE3F8", edgecolor="#2B6CB0", linewidth=1.2),
-        whiskerprops=dict(color="#2B6CB0", linewidth=1.2),
-        capprops=dict(color="#2B6CB0", linewidth=1.2),
-        medianprops=dict(color="#1A202C", linewidth=1.4),
-        flierprops=dict(marker="o", markersize=0),
-    )
+    axes[1].axvline(COLLISION_RADIUS_M, color="#1A202C", linewidth=1.6, linestyle=":")
     jitter_rng = np.random.default_rng(SEED + 101)
-    y_jitter = 0.55 + jitter_rng.uniform(-0.10, 0.10, size=len(min_seps))
-    scatter = axes[1].scatter(
-        min_seps,
-        y_jitter,
-        s=30,
-        color="#2B6CB0",
-        edgecolor="white",
-        linewidth=0.45,
-        alpha=0.82,
-        zorder=3,
-    )
-    mean_line = axes[1].axvline(mean_min_sep, color="#C53030", linewidth=2.0)
-    p05_line = axes[1].axvline(p05_min_sep, color="#DD6B20", linewidth=2.0, linestyle="--")
+    y_positions = {BASELINE.name: 0.70, MITIGATED.name: 0.35}
+    summary_lines = []
+    for mitigation_name in mitigation_names:
+        metrics = summary["results"][mitigation_name]
+        min_seps = np.array([result.min_separation_m for result in metrics["results"]], dtype=float)
+        y_pos = y_positions[mitigation_name]
+        axes[1].plot(
+            [metrics["p10_min_separation_m"], metrics["p90_min_separation_m"]],
+            [y_pos, y_pos],
+            color=colors[mitigation_name],
+            linewidth=9,
+            alpha=0.20,
+            solid_capstyle="round",
+            zorder=1,
+        )
+        axes[1].boxplot(
+            min_seps,
+            vert=False,
+            positions=[y_pos],
+            widths=0.18,
+            patch_artist=True,
+            manage_ticks=False,
+            boxprops=dict(facecolor=colors[mitigation_name], edgecolor=colors[mitigation_name], linewidth=1.2, alpha=0.20),
+            whiskerprops=dict(color=colors[mitigation_name], linewidth=1.2),
+            capprops=dict(color=colors[mitigation_name], linewidth=1.2),
+            medianprops=dict(color="#1A202C", linewidth=1.4),
+            flierprops=dict(marker="o", markersize=0),
+        )
+        y_jitter = y_pos + jitter_rng.uniform(-0.08, 0.08, size=len(min_seps))
+        axes[1].scatter(
+            min_seps,
+            y_jitter,
+            s=26,
+            color=colors[mitigation_name],
+            edgecolor="white",
+            linewidth=0.40,
+            alpha=0.82,
+            zorder=3,
+        )
+        summary_lines.append(
+            f"{'Base' if mitigation_name == BASELINE.name else 'Mitigated'}: "
+            f"mean {metrics['mean_min_separation_m']:.1f} m | 5th pct {metrics['p05_min_separation_m']:.1f} m"
+        )
     axes[1].set_xlim(view_min, view_max)
-    axes[1].set_ylim(0.25, 0.85)
-    axes[1].set_yticks([])
+    axes[1].set_ylim(0.15, 0.90)
+    axes[1].set_yticks([y_positions[BASELINE.name], y_positions[MITIGATED.name]])
+    axes[1].set_yticklabels(["No mitigation", "Hop + redundancy"])
     axes[1].set_xlabel("Minimum pairwise separation (m)")
     axes[1].set_title("Closest Approach Distribution (zoomed)", pad=10)
     axes[1].text(
         0.02,
         0.95,
         f"Threshold = {COLLISION_RADIUS_M:.0f} m\n"
-        f"Mean clearance = {mean_min_sep - COLLISION_RADIUS_M:.2f} m\n"
-        f"5th pct clearance = {p05_min_sep - COLLISION_RADIUS_M:.2f} m",
+        + "\n".join(summary_lines),
         transform=axes[1].transAxes,
         va="top",
         ha="left",
         fontsize=9.5,
         bbox=dict(boxstyle="round,pad=0.28", facecolor="white", edgecolor="#CBD5E0", alpha=0.95),
     )
-    axes[1].legend(
-        [band, mean_line, p05_line, scatter],
-        [
-            f"p10-p90 band {p10_min_sep:.2f}-{p90_min_sep:.2f} m",
-            f"Mean {mean_min_sep:.2f} m",
-            f"5th pct {p05_min_sep:.2f} m",
-            "One point per trial",
-        ],
-        loc="lower right",
-        frameon=False,
-        fontsize=9,
-    )
 
-    fig.suptitle("Five-Drone Collision Monte Carlo Over Six Hours", fontsize=16, y=0.975)
+    fig.suptitle("Five-Drone Collision Monte Carlo Over Six Hours | Baseline vs Mitigated Swarm Gossip", fontsize=16, y=0.975)
     fig.savefig(output_path, dpi=220)
     plt.close(fig)
 
@@ -1486,7 +1605,8 @@ def save_mission_metrics_png(summary, output_path):
     )
     fig.suptitle(
         "Five-Waypoint Mission Monte Carlo | 32 B clear vs 64 B encrypted\n"
-        f"Operator link {OPERATOR_TO_DRONE_FREQ_KHZ:.0f} kHz | Shadow mean {MISSION_SHADOW_MEAN_DB_MIN:.0f}-{MISSION_SHADOW_MEAN_DB_MAX:.0f} dB | Range {min_range_m:.0f}-{max_range_m:.0f} m",
+        f"Operator baseline {OPERATOR_TO_DRONE_FREQ_KHZ:.0f} kHz | Hop pairs include {OPERATOR_HOP_PAIRS_KHZ[1][0]:.0f}/{OPERATOR_HOP_PAIRS_KHZ[1][1]:.0f} kHz | "
+        f"Shadow mean {MISSION_SHADOW_MEAN_DB_MIN:.0f}-{MISSION_SHADOW_MEAN_DB_MAX:.0f} dB | Range {min_range_m:.0f}-{max_range_m:.0f} m",
         fontsize=15,
         y=0.975,
     )
@@ -1494,23 +1614,69 @@ def save_mission_metrics_png(summary, output_path):
     plt.close(fig)
 
 
-def plot_sample_tracks(ax, track_samples, title):
+def plot_sample_tracks(ax, track_samples, center_path, title):
     colors = ["#1F4E79", "#2F855A", "#C05621", "#805AD5", "#C53030"]
     for drone_idx in range(NUM_DRONES):
         ax.plot(track_samples[:, drone_idx, 0], track_samples[:, drone_idx, 1], color=colors[drone_idx], linewidth=1.8, label=f"Drone {drone_idx + 1}")
         ax.scatter(track_samples[0, drone_idx, 0], track_samples[0, drone_idx, 1], color=colors[drone_idx], marker="s", s=20)
         ax.scatter(track_samples[-1, drone_idx, 0], track_samples[-1, drone_idx, 1], color=colors[drone_idx], marker="o", s=24)
 
-    patrol_x = PATROL_CENTERS[:, 0]
-    patrol_y = PATROL_CENTERS[:, 1]
+    patrol_x = center_path[:, 0]
+    patrol_y = center_path[:, 1]
     ax.plot(patrol_x, patrol_y, linestyle="--", color="#1A202C", linewidth=1.2, alpha=0.65, label="Waypoint centers")
     ax.scatter(patrol_x, patrol_y, marker="x", color="#1A202C", s=34)
-    ax.scatter(OPERATOR_POS[0], OPERATOR_POS[1], marker="*", color="#D69E2E", s=130, label="Operator")
 
-    inner = plt.Circle((OPERATOR_POS[0], OPERATOR_POS[1]), 1000.0, color="#718096", fill=False, linestyle=":", linewidth=1.0)
-    outer = plt.Circle((OPERATOR_POS[0], OPERATOR_POS[1]), 2000.0, color="#718096", fill=False, linestyle="--", linewidth=1.0)
-    ax.add_patch(inner)
-    ax.add_patch(outer)
+    x_points = np.concatenate([track_samples[:, :, 0].reshape(-1), patrol_x])
+    y_points = np.concatenate([track_samples[:, :, 1].reshape(-1), patrol_y])
+    x_pad = 28.0
+    y_extent = max(abs(float(np.min(y_points))), abs(float(np.max(y_points))))
+    y_pad = max(16.0, 0.18 * max(y_extent, 1.0))
+    x_limits = (float(np.min(x_points) - x_pad), float(np.max(x_points) + x_pad))
+    y_limits = (-y_extent - y_pad, y_extent + y_pad)
+    ax.set_xlim(*x_limits)
+    ax.set_ylim(*y_limits)
+
+    inset = ax.inset_axes([0.03, 0.06, 0.28, 0.28])
+    inset.set_facecolor("#F7FAFC")
+    inset.plot(patrol_x, patrol_y, linestyle="--", color="#1A202C", linewidth=0.9, alpha=0.65)
+    inset.scatter(patrol_x, patrol_y, marker="x", color="#1A202C", s=16)
+    inset.scatter(OPERATOR_POS[0], OPERATOR_POS[1], marker="*", color="#D69E2E", s=60)
+    inset.add_patch(plt.Circle((OPERATOR_POS[0], OPERATOR_POS[1]), 1000.0, color="#718096", fill=False, linestyle=":", linewidth=0.9))
+    inset.add_patch(plt.Circle((OPERATOR_POS[0], OPERATOR_POS[1]), 2000.0, color="#718096", fill=False, linestyle="--", linewidth=0.9))
+    inset.add_patch(
+        Rectangle(
+            (x_limits[0], y_limits[0]),
+            x_limits[1] - x_limits[0],
+            y_limits[1] - y_limits[0],
+            facecolor="#90CDF4",
+            edgecolor="#2B6CB0",
+            linewidth=1.0,
+            alpha=0.18,
+        )
+    )
+    context_x_min = min(OPERATOR_POS[0] - 250.0, x_limits[0] - 120.0)
+    context_x_max = max(float(np.max(patrol_x)) + 140.0, x_limits[1] + 60.0)
+    context_y_extent = max(2200.0, abs(y_limits[0]) * 2.2)
+    inset.set_xlim(context_x_min, context_x_max)
+    inset.set_ylim(-context_y_extent, context_y_extent)
+    inset.set_xticks([])
+    inset.set_yticks([])
+    inset.set_aspect("equal", adjustable="box")
+    for spine in inset.spines.values():
+        spine.set_color("#A0AEC0")
+        spine.set_linewidth(0.8)
+
+    min_range_m, max_range_m = range_bounds_for_centers(center_path)
+    ax.text(
+        0.03,
+        0.98,
+        f"Operator standoff {min_range_m/1000.0:.2f}-{max_range_m/1000.0:.2f} km",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.6,
+        bbox=dict(boxstyle="round,pad=0.24", facecolor="white", edgecolor="#CBD5E0", alpha=0.92),
+    )
 
     ax.set_title(title, pad=10)
     ax.set_xlabel("X position (m)")
@@ -1520,35 +1686,61 @@ def plot_sample_tracks(ax, track_samples, title):
 
 def save_track_png(collision_summary, mission_summary, output_path):
     plt.style.use("seaborn-v0_8-whitegrid")
-    fig, axes = plt.subplots(2, 3, figsize=(16.5, 10.2), sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, 3, figsize=(16.5, 10.2))
     fig.subplots_adjust(left=0.05, right=0.99, bottom=0.08, top=0.81, wspace=0.12, hspace=0.22)
 
-    plot_sample_tracks(axes[0, 0], collision_summary["example"].track_samples, "Collision-only patrol example")
-    plot_sample_tracks(axes[0, 1], mission_summary["32 B clear"]["results"][BASELINE.name]["example"].track_samples, "32 B clear | No mitigation")
-    plot_sample_tracks(axes[0, 2], mission_summary["32 B clear"]["results"][MITIGATED.name]["example"].track_samples, "32 B clear | Hop + redundancy")
-    plot_sample_tracks(axes[1, 0], mission_summary["64 B encrypted"]["results"][BASELINE.name]["example"].track_samples, "64 B encrypted | No mitigation")
-    plot_sample_tracks(axes[1, 1], mission_summary["64 B encrypted"]["results"][MITIGATED.name]["example"].track_samples, "64 B encrypted | Hop + redundancy")
-    axes[1, 2].axis("off")
-    axes[1, 2].text(
-        0.02,
-        0.92,
-        "Packet-size cases\n\n"
-        "32 B clear:\n"
-        "metadata + data only\n\n"
-        "64 B encrypted:\n"
-        "32 B packet + 32 B encryption overhead\n\n"
-        "Dashed rings:\n"
-        "1 km and 2 km standoff",
-        transform=axes[1, 2].transAxes,
-        va="top",
-        fontsize=11,
+    plot_sample_tracks(
+        axes[0, 0],
+        collision_summary["results"][BASELINE.name]["example"].track_samples,
+        COLLISION_PATROL_CENTERS,
+        "Collision-only | No mitigation",
+    )
+    plot_sample_tracks(
+        axes[0, 1],
+        collision_summary["results"][MITIGATED.name]["example"].track_samples,
+        COLLISION_PATROL_CENTERS,
+        "Collision-only | Hop + redundancy",
+    )
+    plot_sample_tracks(
+        axes[0, 2],
+        mission_summary["32 B clear"]["results"][BASELINE.name]["example"].track_samples,
+        PATROL_CENTERS,
+        "32 B clear | No mitigation",
+    )
+    plot_sample_tracks(
+        axes[1, 0],
+        mission_summary["32 B clear"]["results"][MITIGATED.name]["example"].track_samples,
+        PATROL_CENTERS,
+        "32 B clear | Hop + redundancy",
+    )
+    plot_sample_tracks(
+        axes[1, 1],
+        mission_summary["64 B encrypted"]["results"][BASELINE.name]["example"].track_samples,
+        PATROL_CENTERS,
+        "64 B encrypted | No mitigation",
+    )
+    plot_sample_tracks(
+        axes[1, 2],
+        mission_summary["64 B encrypted"]["results"][MITIGATED.name]["example"].track_samples,
+        PATROL_CENTERS,
+        "64 B encrypted | Hop + redundancy",
     )
 
-    handles, labels = axes[0, 2].get_legend_handles_labels()
+    colors = ["#1F4E79", "#2F855A", "#C05621", "#805AD5", "#C53030"]
+    handles = [Line2D([0], [0], color=colors[idx], linewidth=1.8) for idx in range(NUM_DRONES)]
+    labels = [f"Drone {idx + 1}" for idx in range(NUM_DRONES)]
+    handles.extend(
+        [
+            Line2D([0], [0], color="#1A202C", linestyle="--", linewidth=1.2),
+            Line2D([0], [0], marker="*", color="#D69E2E", linestyle="None", markersize=10),
+        ]
+    )
+    labels.extend(["Waypoint centers", "Operator"])
     fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.90), ncols=4, frameon=False, fontsize=9)
     fig.suptitle(
-        "Five-Drone XY Motion with Operator Standoff Rings and Packet-Size Cases\n"
-        f"Operator {OPERATOR_TO_DRONE_FREQ_KHZ:.0f} kHz | Swarm {DRONE_TO_DRONE_FREQ_KHZ:.0f} kHz",
+        "Five-Drone XY Motion | Collision and Mission Examples\n"
+        f"Operator baseline {OPERATOR_TO_DRONE_FREQ_KHZ:.0f} kHz, hop-pair set around 28 kHz | "
+        f"Swarm baseline {DRONE_TO_DRONE_FREQ_KHZ:.0f} kHz, hop-pair set around 50 kHz",
         fontsize=16,
         y=0.975,
     )
@@ -1561,24 +1753,34 @@ def print_summary(collision_summary, mission_summary):
     print("Five-drone underwater fleet simulation")
     print(f"Operator position: ({OPERATOR_POS[0]:.0f}, {OPERATOR_POS[1]:.0f}, {OPERATOR_POS[2]:.0f}) m")
     print(f"Operator-to-drone geometry envelope from waypoint plan: min {min_range_m:.0f} m, max {max_range_m:.0f} m")
-    print(f"Configured link frequencies: operator-drone {OPERATOR_TO_DRONE_FREQ_KHZ:.0f} kHz, drone-drone {DRONE_TO_DRONE_FREQ_KHZ:.0f} kHz")
+    print(
+        f"Configured link frequencies: operator baseline {OPERATOR_TO_DRONE_FREQ_KHZ:.0f} kHz, "
+        f"operator hop pairs {OPERATOR_HOP_PAIRS_KHZ}, "
+        f"drone baseline {DRONE_TO_DRONE_FREQ_KHZ:.0f} kHz, "
+        f"drone hop pairs {DRONE_HOP_PAIRS_KHZ}"
+    )
     print(
         f"Swarm coordination: {GOSSIP_SENDERS_PER_STEP} gossip sender(s) per control step at 50 kHz; "
-        f"avoidance uses last received peer state; base access miss {GOSSIP_ACCESS_MISS_PROB:.2f}"
+        f"avoidance uses dead-reckoned peer state; base access miss {GOSSIP_ACCESS_MISS_PROB:.2f}; "
+        f"prediction horizon {DEAD_RECKONING_HORIZON_S:.0f}s"
     )
+    print("Mitigation packet copies are sent simultaneously on the active hop pair, not as serial retransmissions")
     print(f"Mission shadowing: trial mean sampled uniformly from {MISSION_SHADOW_MEAN_DB_MIN:.1f} dB to {MISSION_SHADOW_MEAN_DB_MAX:.1f} dB")
     print()
     print("Experiment 1: collision-only autonomous patrol over 6 hours")
-    print(
-        f"  trials={collision_summary['trials']}"
-        f"  collision_free_rate={collision_summary['collision_free_rate']:.3f}"
-        f" ci95=[{collision_summary['collision_free_ci_low']:.3f},{collision_summary['collision_free_ci_high']:.3f}]"
-        f" mean_min_separation={collision_summary['mean_min_separation_m']:.1f}m"
-        f" p10-p90=[{collision_summary['p10_min_separation_m']:.1f},{collision_summary['p90_min_separation_m']:.1f}]m"
-        f" p05_min_separation={collision_summary['p05_min_separation_m']:.1f}m"
-        f" gossip_delivery={collision_summary['mean_gossip_delivery_rate']:.3f}"
-        f" mean_peer_age={collision_summary['mean_peer_age_s']:.1f}s"
-    )
+    print(f"  trials={collision_summary['trials']}")
+    for mitigation_name in [BASELINE.name, MITIGATED.name]:
+        metrics = collision_summary["results"][mitigation_name]
+        print(
+            f"    {mitigation_name:26s}"
+            f" collision_free_rate={metrics['collision_free_rate']:.3f}"
+            f" ci95=[{metrics['collision_free_ci_low']:.3f},{metrics['collision_free_ci_high']:.3f}]"
+            f" mean_min_separation={metrics['mean_min_separation_m']:.1f}m"
+            f" p10-p90=[{metrics['p10_min_separation_m']:.1f},{metrics['p90_min_separation_m']:.1f}]m"
+            f" p05_min_separation={metrics['p05_min_separation_m']:.1f}m"
+            f" gossip_delivery={metrics['mean_gossip_delivery_rate']:.3f}"
+            f" mean_peer_age={metrics['mean_peer_age_s']:.1f}s"
+        )
     print()
     print("Experiment 2: operator sends 5 sequential waypoints with representative SYN/ACK handshakes")
     for packet_name, packet_summary in mission_summary.items():
@@ -1659,12 +1861,13 @@ def main():
     trial_preset = TRIAL_PRESETS[trial_preset_name]
     collision_summary = run_collision_monte_carlo(trial_preset.collision_trials, args.workers)
     mission_summary = run_operator_monte_carlo(trial_preset.mission_trials, args.workers)
+    output_dir = os.path.dirname(__file__)
 
-    save_collision_png(collision_summary, "fleet_collision_summary.png")
-    save_mission_metrics_png(mission_summary, "fleet_mission_metrics.png")
-    save_track_png(collision_summary, mission_summary, "fleet_motion_tracks.png")
-    save_collision_csv(collision_summary, "fleet_collision_summary.csv")
-    save_mission_csv(mission_summary, "fleet_mission_summary.csv")
+    save_collision_png(collision_summary, os.path.join(output_dir, "fleet_collision_summary.png"))
+    save_mission_metrics_png(mission_summary, os.path.join(output_dir, "fleet_mission_metrics.png"))
+    save_track_png(collision_summary, mission_summary, os.path.join(output_dir, "fleet_motion_tracks.png"))
+    save_collision_csv(collision_summary, os.path.join(output_dir, "fleet_collision_summary.csv"))
+    save_mission_csv(mission_summary, os.path.join(output_dir, "fleet_mission_summary.csv"))
     print_summary(collision_summary, mission_summary)
 
 
