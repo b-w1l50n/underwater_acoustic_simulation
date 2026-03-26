@@ -53,7 +53,8 @@ GOSSIP_SENDERS_PER_STEP = 5
 GOSSIP_ACCESS_MISS_PROB = 0.01
 FREQUENCY_DIVERSITY_OFFSETS_KHZ = (-2.0, 2.0)
 
-DATA_RATE_BPS = 2400.0
+OPERATOR_DATA_RATE_BPS = 5120.0
+SWARM_DATA_RATE_BPS = 10240.0
 PREAMBLE_S = 0.08
 MAX_HANDSHAKE_ATTEMPTS = 4
 HANDSHAKE_BACKOFF_S = 10.0
@@ -175,6 +176,8 @@ class CollisionTrialResult:
     collision_time_s: Optional[float]
     gossip_delivery_rate: float
     mean_peer_age_s: float
+    mean_gossip_latency_ms: float
+    mean_gossip_bitrate_bps: float
     track_samples: np.ndarray
 
 
@@ -194,6 +197,8 @@ class MissionTrialResult:
     mean_snr_db: float
     gossip_delivery_rate: float
     mean_peer_age_s: float
+    mean_gossip_latency_ms: float
+    mean_gossip_bitrate_bps: float
     track_samples: np.ndarray
     chosen_leaders: list
 
@@ -311,7 +316,10 @@ def update_swarm_beliefs(positions, velocities, belief_state, environment, mitig
 
     tx_count = 0
     success_count = 0
+    successful_latency_sum_s = 0.0
+    transmitted_bits_sum = 0.0
     access_miss_prob = GOSSIP_ACCESS_MISS_PROB
+    packet_bytes_on_air = effective_packet_bytes(packet_bytes, mitigation)
 
     for slot_idx in range(GOSSIP_SENDERS_PER_STEP):
         sender_idx = (belief_state.next_sender_idx + slot_idx) % NUM_DRONES
@@ -334,14 +342,16 @@ def update_swarm_beliefs(positions, velocities, belief_state, environment, mitig
                 trial_rng,
                 DRONE_TO_DRONE_FREQ_KHZ,
             )
+            transmitted_bits_sum += gossip.transmissions * packet_bytes_on_air * 8.0
             if gossip.success:
                 belief_state.perceived_positions[receiver_idx, sender_idx] = sender_pos
                 belief_state.perceived_velocities[receiver_idx, sender_idx] = sender_vel
                 belief_state.peer_age_s[receiver_idx, sender_idx] = 0.0
                 success_count += 1
+                successful_latency_sum_s += gossip.latency_s
 
     belief_state.next_sender_idx = (belief_state.next_sender_idx + GOSSIP_SENDERS_PER_STEP) % NUM_DRONES
-    return tx_count, success_count
+    return tx_count, success_count, successful_latency_sum_s, transmitted_bits_sum
 
 
 def init_fleet(trial_rng, start_center=PATROL_START_CENTER):
@@ -402,6 +412,12 @@ def transmission_loss_db(range_m, freq_khz):
     return spreading + absorption
 
 
+def data_rate_bps_for_freq(freq_khz):
+    if abs(freq_khz - OPERATOR_TO_DRONE_FREQ_KHZ) <= abs(freq_khz - DRONE_TO_DRONE_FREQ_KHZ):
+        return OPERATOR_DATA_RATE_BPS
+    return SWARM_DATA_RATE_BPS
+
+
 def multipath_penalty_db(range_m, tx_depth_m, rx_depth_m, environment, freq_khz):
     if range_m < 5.0:
         return 0.0
@@ -420,7 +436,7 @@ def multipath_penalty_db(range_m, tx_depth_m, rx_depth_m, environment, freq_khz)
 
     coherent_gain = abs(direct_amp + reflected_amp * math.cos(phase_term)) / max(direct_amp, 1e-9)
     fading_penalty = -20.0 * math.log10(clamp(coherent_gain, 1e-4, 1e4))
-    symbol_s = 1.0 / DATA_RATE_BPS
+    symbol_s = 1.0 / data_rate_bps_for_freq(freq_khz)
     delay_spread_s = excess_path / SOUND_SPEED_MPS
     isi_penalty = 10.0 * math.log10(1.0 + delay_spread_s / max(symbol_s, 1e-6))
     return clamp(fading_penalty + isi_penalty, 0.0, MAX_MULTIPATH_PENALTY_DB)
@@ -428,7 +444,7 @@ def multipath_penalty_db(range_m, tx_depth_m, rx_depth_m, environment, freq_khz)
 
 def doppler_penalty_db(radial_velocity_mps, freq_khz):
     doppler_hz = abs(radial_velocity_mps) * freq_khz * 1000.0 / SOUND_SPEED_MPS
-    normalized = doppler_hz / max(DATA_RATE_BPS / 4.0, 1.0)
+    normalized = doppler_hz / max(data_rate_bps_for_freq(freq_khz) / 4.0, 1.0)
     return clamp(10.0 * math.log10(1.0 + normalized * normalized), 0.0, MAX_DOPPLER_PENALTY_DB)
 
 
@@ -451,6 +467,10 @@ def packet_error_rate(snr_db, packet_bytes):
     ber = 0.5 * math.erfc(math.sqrt(max(eb_n0, 0.0)))
     bits = packet_bytes * 8
     return clamp(1.0 - (1.0 - ber) ** bits, 0.0, 1.0)
+
+
+def effective_packet_bytes(packet_bytes, mitigation):
+    return max(8, int(round(packet_bytes * mitigation.payload_scale)))
 
 
 def packet_copy_frequencies_khz(base_freq_khz, mitigation, trial_rng):
@@ -490,7 +510,7 @@ def narrowband_penalty_db(copy_freq_khz, notch_center_khz, notch_depth_db):
 
 
 def transmit_packet(tx_pos, rx_pos, tx_vel, rx_vel, packet_bytes, environment, mitigation, trial_rng, freq_khz):
-    packet_bytes = max(8, int(round(packet_bytes * mitigation.payload_scale)))
+    packet_bytes = effective_packet_bytes(packet_bytes, mitigation)
     copy_freqs_khz = packet_copy_frequencies_khz(freq_khz, mitigation, trial_rng)
     best_snr_db = -1e9
     parallel_copies = len(copy_freqs_khz)
@@ -508,7 +528,8 @@ def transmit_packet(tx_pos, rx_pos, tx_vel, rx_vel, packet_bytes, environment, m
         fading_db = common_shadow_db + wideband_bad_fade_db + selective_fade_db + frequency_selective_db
         snr_db, range_m = link_snr_db(tx_pos, rx_pos, tx_vel, rx_vel, environment, fading_db, copy_freq_khz)
         per = packet_error_rate(snr_db, packet_bytes)
-        latency_s = range_m / SOUND_SPEED_MPS + PREAMBLE_S + packet_bytes * 8.0 / DATA_RATE_BPS
+        data_rate_bps = data_rate_bps_for_freq(copy_freq_khz)
+        latency_s = range_m / SOUND_SPEED_MPS + PREAMBLE_S + packet_bytes * 8.0 / data_rate_bps
         latency_s *= trial_rng.uniform(LATENCY_JITTER_MIN, LATENCY_JITTER_MAX)
         last_latency_s = latency_s
         best_snr_db = max(best_snr_db, snr_db)
@@ -539,7 +560,7 @@ def step_fleet(
     trial_rng,
     station_keep=False,
 ):
-    gossip_tx_count, gossip_success_count = update_swarm_beliefs(
+    gossip_tx_count, gossip_success_count, gossip_latency_sum_s, gossip_bits_sum = update_swarm_beliefs(
         positions,
         velocities,
         belief_state,
@@ -606,7 +627,15 @@ def step_fleet(
     belief_state.perceived_positions[diag_idx, diag_idx] = new_positions
     belief_state.perceived_velocities[diag_idx, diag_idx] = new_velocities
     belief_state.peer_age_s[diag_idx, diag_idx] = 0.0
-    return new_positions, new_velocities, gossip_tx_count, gossip_success_count, mean_peer_age(belief_state.peer_age_s)
+    return (
+        new_positions,
+        new_velocities,
+        gossip_tx_count,
+        gossip_success_count,
+        gossip_latency_sum_s,
+        gossip_bits_sum,
+        mean_peer_age(belief_state.peer_age_s),
+    )
 
 
 def simulate_hold(
@@ -628,9 +657,11 @@ def simulate_hold(
     collision_time = None
     gossip_tx_count = 0
     gossip_success_count = 0
+    gossip_latency_sum_s = 0.0
+    gossip_bits_sum = 0.0
     peer_age_sum = 0.0
     for step_idx in range(steps):
-        positions, velocities, step_tx_count, step_success_count, step_peer_age = step_fleet(
+        positions, velocities, step_tx_count, step_success_count, step_gossip_latency_s, step_gossip_bits, step_peer_age = step_fleet(
             positions,
             velocities,
             belief_state,
@@ -645,13 +676,27 @@ def simulate_hold(
         )
         gossip_tx_count += step_tx_count
         gossip_success_count += step_success_count
+        gossip_latency_sum_s += step_gossip_latency_s
+        gossip_bits_sum += step_gossip_bits
         peer_age_sum += step_peer_age
         min_sep = min(min_sep, pairwise_min_separation_xy(positions))
         if min_sep < COLLISION_RADIUS_M and collision_time is None:
             collision_time = 0.0
         if sample_store is not None and step_idx % TRACK_SAMPLE_EVERY_STEPS == 0:
             sample_store.append(positions[:, :2].copy())
-    return positions, velocities, min_sep, collision_time, steps * DT, gossip_tx_count, gossip_success_count, peer_age_sum, steps
+    return (
+        positions,
+        velocities,
+        min_sep,
+        collision_time,
+        steps * DT,
+        gossip_tx_count,
+        gossip_success_count,
+        gossip_latency_sum_s,
+        gossip_bits_sum,
+        peer_age_sum,
+        steps,
+    )
 
 
 def simulate_to_waypoint(
@@ -674,11 +719,13 @@ def simulate_to_waypoint(
     arrived = False
     gossip_tx_count = 0
     gossip_success_count = 0
+    gossip_latency_sum_s = 0.0
+    gossip_bits_sum = 0.0
     peer_age_sum = 0.0
 
     step_idx = 0
     while elapsed < time_budget_s:
-        positions, velocities, step_tx_count, step_success_count, step_peer_age = step_fleet(
+        positions, velocities, step_tx_count, step_success_count, step_gossip_latency_s, step_gossip_bits, step_peer_age = step_fleet(
             positions,
             velocities,
             belief_state,
@@ -693,6 +740,8 @@ def simulate_to_waypoint(
         )
         gossip_tx_count += step_tx_count
         gossip_success_count += step_success_count
+        gossip_latency_sum_s += step_gossip_latency_s
+        gossip_bits_sum += step_gossip_bits
         peer_age_sum += step_peer_age
         if sample_store is not None and step_idx % TRACK_SAMPLE_EVERY_STEPS == 0:
             sample_store.append(positions[:, :2].copy())
@@ -706,7 +755,20 @@ def simulate_to_waypoint(
             arrived = True
             break
 
-    return positions, velocities, arrived, min_sep, collision_time, elapsed, gossip_tx_count, gossip_success_count, peer_age_sum, max(step_idx, 1)
+    return (
+        positions,
+        velocities,
+        arrived,
+        min_sep,
+        collision_time,
+        elapsed,
+        gossip_tx_count,
+        gossip_success_count,
+        gossip_latency_sum_s,
+        gossip_bits_sum,
+        peer_age_sum,
+        max(step_idx, 1),
+    )
 
 
 def perform_command_handshake(positions, velocities, environment, mitigation, packet_profile, trial_rng):
@@ -811,7 +873,7 @@ def perform_arrival_handshake(positions, velocities, environment, mitigation, pa
     return HandshakeResult(False, total_latency_s, total_tx_count, total_success_count, MAX_HANDSHAKE_ATTEMPTS - 1, snr_samples, leader_idx)
 
 
-def run_collision_trial(trial_seed, mitigation, store_track=True):
+def run_collision_trial(trial_seed, mitigation, packet_profile, store_track=True):
     trial_rng = np.random.default_rng(trial_seed)
     positions, velocities, control_bias = init_fleet(trial_rng, start_center=COLLISION_START_CENTER)
     belief_state = init_swarm_belief_state(positions, velocities)
@@ -822,13 +884,15 @@ def run_collision_trial(trial_seed, mitigation, store_track=True):
     track_samples = [positions[:, :2].copy()] if store_track else None
     gossip_tx_count = 0
     gossip_success_count = 0
+    gossip_latency_sum_s = 0.0
+    gossip_bits_sum = 0.0
     peer_age_sum = 0.0
 
     total_steps = int(COLLISION_SIM_DURATION_S / DT)
     for step in range(total_steps):
         center_target = COLLISION_PATROL_CENTERS[target_idx]
         targets = COLLISION_PATROL_TARGETS[target_idx]
-        positions, velocities, step_tx_count, step_success_count, step_peer_age = step_fleet(
+        positions, velocities, step_tx_count, step_success_count, step_gossip_latency_s, step_gossip_bits, step_peer_age = step_fleet(
             positions,
             velocities,
             belief_state,
@@ -837,12 +901,14 @@ def run_collision_trial(trial_seed, mitigation, store_track=True):
             center_target,
             COLLISION_ENVIRONMENT,
             mitigation,
-            GOSSIP_PACKET_BYTES,
+            packet_profile.packet_bytes,
             trial_rng,
             station_keep=False,
         )
         gossip_tx_count += step_tx_count
         gossip_success_count += step_success_count
+        gossip_latency_sum_s += step_gossip_latency_s
+        gossip_bits_sum += step_gossip_bits
         peer_age_sum += step_peer_age
         if track_samples is not None and step % TRACK_SAMPLE_EVERY_STEPS == 0:
             track_samples.append(positions[:, :2].copy())
@@ -861,6 +927,8 @@ def run_collision_trial(trial_seed, mitigation, store_track=True):
         collision_time_s=collision_time_s,
         gossip_delivery_rate=gossip_success_count / max(gossip_tx_count, 1),
         mean_peer_age_s=peer_age_sum / max(total_steps, 1),
+        mean_gossip_latency_ms=(gossip_latency_sum_s / max(gossip_success_count, 1)) * MS_PER_SECOND,
+        mean_gossip_bitrate_bps=gossip_bits_sum / max(COLLISION_SIM_DURATION_S, DT),
         track_samples=np.array(track_samples) if track_samples is not None else np.empty((0, NUM_DRONES, 2)),
     )
 
@@ -897,6 +965,8 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
     snr_samples = []
     gossip_tx_count = 0
     gossip_success_count = 0
+    gossip_latency_sum_s = 0.0
+    gossip_bits_sum = 0.0
     peer_age_sum = 0.0
     peer_age_steps = 0
 
@@ -911,7 +981,19 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
         command_latencies_ms.append(handshake.latency_s * MS_PER_SECOND)
         snr_samples.extend(handshake.snr_samples)
 
-        positions, velocities, min_sep, collision_during_hold, hold_elapsed, hold_tx_count, hold_success_count, hold_peer_age_sum, hold_steps = simulate_hold(
+        (
+            positions,
+            velocities,
+            min_sep,
+            collision_during_hold,
+            hold_elapsed,
+            hold_tx_count,
+            hold_success_count,
+            hold_gossip_latency_sum_s,
+            hold_gossip_bits_sum,
+            hold_peer_age_sum,
+            hold_steps,
+        ) = simulate_hold(
             positions,
             velocities,
             belief_state,
@@ -928,6 +1010,8 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
         )
         gossip_tx_count += hold_tx_count
         gossip_success_count += hold_success_count
+        gossip_latency_sum_s += hold_gossip_latency_sum_s
+        gossip_bits_sum += hold_gossip_bits_sum
         peer_age_sum += hold_peer_age_sum
         peer_age_steps += hold_steps
         total_time_s += hold_elapsed
@@ -937,7 +1021,20 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
         if not handshake.success or total_time_s >= MISSION_TIMEOUT_S:
             break
 
-        positions, velocities, arrived, min_sep, collision_during_travel, travel_elapsed, travel_tx_count, travel_success_count, travel_peer_age_sum, travel_steps = simulate_to_waypoint(
+        (
+            positions,
+            velocities,
+            arrived,
+            min_sep,
+            collision_during_travel,
+            travel_elapsed,
+            travel_tx_count,
+            travel_success_count,
+            travel_gossip_latency_sum_s,
+            travel_gossip_bits_sum,
+            travel_peer_age_sum,
+            travel_steps,
+        ) = simulate_to_waypoint(
             positions,
             velocities,
             belief_state,
@@ -954,6 +1051,8 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
         )
         gossip_tx_count += travel_tx_count
         gossip_success_count += travel_success_count
+        gossip_latency_sum_s += travel_gossip_latency_sum_s
+        gossip_bits_sum += travel_gossip_bits_sum
         peer_age_sum += travel_peer_age_sum
         peer_age_steps += travel_steps
         total_time_s += travel_elapsed
@@ -972,7 +1071,19 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
         arrival_latencies_ms.append(arrival.latency_s * MS_PER_SECOND)
         snr_samples.extend(arrival.snr_samples)
 
-        positions, velocities, min_sep, collision_during_hold, hold_elapsed, hold_tx_count, hold_success_count, hold_peer_age_sum, hold_steps = simulate_hold(
+        (
+            positions,
+            velocities,
+            min_sep,
+            collision_during_hold,
+            hold_elapsed,
+            hold_tx_count,
+            hold_success_count,
+            hold_gossip_latency_sum_s,
+            hold_gossip_bits_sum,
+            hold_peer_age_sum,
+            hold_steps,
+        ) = simulate_hold(
             positions,
             velocities,
             belief_state,
@@ -989,6 +1100,8 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
         )
         gossip_tx_count += hold_tx_count
         gossip_success_count += hold_success_count
+        gossip_latency_sum_s += hold_gossip_latency_sum_s
+        gossip_bits_sum += hold_gossip_bits_sum
         peer_age_sum += hold_peer_age_sum
         peer_age_steps += hold_steps
         total_time_s += hold_elapsed
@@ -1019,14 +1132,16 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
         mean_snr_db=float(np.mean(snr_samples)) if snr_samples else 0.0,
         gossip_delivery_rate=gossip_success_count / max(gossip_tx_count, 1),
         mean_peer_age_s=peer_age_sum / max(peer_age_steps, 1),
+        mean_gossip_latency_ms=(gossip_latency_sum_s / max(gossip_success_count, 1)) * MS_PER_SECOND,
+        mean_gossip_bitrate_bps=gossip_bits_sum / max(total_time_s, DT),
         track_samples=np.array(track_samples) if track_samples is not None else np.empty((0, NUM_DRONES, 2)),
         chosen_leaders=chosen_leaders,
     )
 
 
 def collision_trial_task(task):
-    trial_seed, mitigation, store_track = task
-    return run_collision_trial(int(trial_seed), mitigation, store_track=store_track)
+    trial_seed, mitigation, packet_profile, store_track = task
+    return run_collision_trial(int(trial_seed), mitigation, packet_profile, store_track=store_track)
 
 
 def mission_trial_task(task):
@@ -1058,32 +1173,57 @@ def parallel_trial_map(task_func, tasks, worker_count):
 
 
 def run_collision_monte_carlo(trial_count, worker_count):
-    summary = {"trials": trial_count, "results": {}}
+    summary = {}
     seeds = rng.integers(0, 2**31 - 1, size=trial_count)
-    for mitigation in [BASELINE, MITIGATED]:
-        tasks = [(int(seed), mitigation, False) for seed in seeds]
-        results = parallel_trial_map(collision_trial_task, tasks, resolve_worker_count(worker_count, len(tasks)))
-        best_seed = max(results, key=lambda result: result.min_separation_m).trial_seed
-        best_example = run_collision_trial(best_seed, mitigation, store_track=True)
-        collision_flags = [result.collision_free for result in results]
-        min_separations = [result.min_separation_m for result in results]
-        gossip_delivery_rates = [result.gossip_delivery_rate for result in results]
-        peer_ages = [result.mean_peer_age_s for result in results]
-        collision_ci_low, collision_ci_high = binomial_confidence_interval(collision_flags)
-        p10_min_sep, p90_min_sep = percentile_bounds(min_separations, low=10.0, high=90.0)
-        summary["results"][mitigation.name] = {
-            "collision_free_rate": float(np.mean(collision_flags)),
-            "collision_free_ci_low": collision_ci_low,
-            "collision_free_ci_high": collision_ci_high,
-            "mean_min_separation_m": float(np.mean(min_separations)),
-            "p05_min_separation_m": float(np.percentile(min_separations, 5)),
-            "p10_min_separation_m": p10_min_sep,
-            "p90_min_separation_m": p90_min_sep,
-            "mean_gossip_delivery_rate": float(np.mean(gossip_delivery_rates)),
-            "mean_peer_age_s": float(np.mean(peer_ages)),
-            "example": best_example,
-            "results": results,
+    for packet_profile in PACKET_PROFILES:
+        summary[packet_profile.name] = {
+            "trials": trial_count,
+            "packet_bytes": packet_profile.packet_bytes,
+            "encrypted": packet_profile.encrypted,
+            "results": {},
         }
+        for mitigation in [BASELINE, MITIGATED]:
+            tasks = [(int(seed), mitigation, packet_profile, False) for seed in seeds]
+            results = parallel_trial_map(collision_trial_task, tasks, resolve_worker_count(worker_count, len(tasks)))
+            best_seed = max(results, key=lambda result: result.min_separation_m).trial_seed
+            best_example = run_collision_trial(best_seed, mitigation, packet_profile, store_track=True)
+            collision_flags = [result.collision_free for result in results]
+            min_separations = [result.min_separation_m for result in results]
+            gossip_delivery_rates = [result.gossip_delivery_rate for result in results]
+            gossip_loss_rates = [1.0 - result.gossip_delivery_rate for result in results]
+            peer_ages = [result.mean_peer_age_s for result in results]
+            gossip_latencies_ms = [result.mean_gossip_latency_ms for result in results]
+            gossip_bitrate_bps = [result.mean_gossip_bitrate_bps for result in results]
+            collision_ci_low, collision_ci_high = binomial_confidence_interval(collision_flags)
+            mean_min_sep, p10_min_sep, p90_min_sep = metric_summary(min_separations)
+            mean_gossip_loss_rate, p10_gossip_loss_rate, p90_gossip_loss_rate = metric_summary(gossip_loss_rates)
+            mean_peer_age_s, p10_peer_age_s, p90_peer_age_s = metric_summary(peer_ages)
+            mean_gossip_latency_ms, p10_gossip_latency_ms, p90_gossip_latency_ms = metric_summary(gossip_latencies_ms)
+            mean_gossip_bitrate_bps, p10_gossip_bitrate_bps, p90_gossip_bitrate_bps = metric_summary(gossip_bitrate_bps)
+            summary[packet_profile.name]["results"][mitigation.name] = {
+                "collision_free_rate": float(np.mean(collision_flags)),
+                "collision_free_ci_low": collision_ci_low,
+                "collision_free_ci_high": collision_ci_high,
+                "mean_min_separation_m": mean_min_sep,
+                "p05_min_separation_m": float(np.percentile(min_separations, 5)),
+                "p10_min_separation_m": p10_min_sep,
+                "p90_min_separation_m": p90_min_sep,
+                "mean_gossip_delivery_rate": float(np.mean(gossip_delivery_rates)),
+                "mean_gossip_loss_rate": mean_gossip_loss_rate,
+                "p10_gossip_loss_rate": p10_gossip_loss_rate,
+                "p90_gossip_loss_rate": p90_gossip_loss_rate,
+                "mean_peer_age_s": mean_peer_age_s,
+                "p10_peer_age_s": p10_peer_age_s,
+                "p90_peer_age_s": p90_peer_age_s,
+                "mean_gossip_latency_ms": mean_gossip_latency_ms,
+                "p10_gossip_latency_ms": p10_gossip_latency_ms,
+                "p90_gossip_latency_ms": p90_gossip_latency_ms,
+                "mean_gossip_bitrate_bps": mean_gossip_bitrate_bps,
+                "p10_gossip_bitrate_bps": p10_gossip_bitrate_bps,
+                "p90_gossip_bitrate_bps": p90_gossip_bitrate_bps,
+                "example": best_example,
+                "results": results,
+            }
     return summary
 
 
@@ -1119,7 +1259,14 @@ def run_operator_monte_carlo(trial_count, worker_count):
             mean_retries, p10_retries, p90_retries = metric_summary([result.mean_retries_per_waypoint for result in results])
             mean_snr, p10_snr, p90_snr = metric_summary([result.mean_snr_db for result in results])
             mean_gossip_delivery = float(np.mean([result.gossip_delivery_rate for result in results]))
-            mean_peer_age_s = float(np.mean([result.mean_peer_age_s for result in results]))
+            mean_gossip_loss, p10_gossip_loss, p90_gossip_loss = metric_summary([1.0 - result.gossip_delivery_rate for result in results])
+            mean_peer_age_s, p10_peer_age_s, p90_peer_age_s = metric_summary([result.mean_peer_age_s for result in results])
+            mean_gossip_latency_ms, p10_gossip_latency_ms, p90_gossip_latency_ms = metric_summary(
+                [result.mean_gossip_latency_ms for result in results]
+            )
+            mean_gossip_bitrate_bps, p10_gossip_bitrate_bps, p90_gossip_bitrate_bps = metric_summary(
+                [result.mean_gossip_bitrate_bps for result in results]
+            )
             summary[packet_profile.name]["results"][mitigation.name] = {
                 "mission_success_rate": float(np.mean(success_flags)),
                 "mission_success_ci_low": success_ci_low,
@@ -1155,7 +1302,18 @@ def run_operator_monte_carlo(trial_count, worker_count):
                 "p10_snr_db": p10_snr,
                 "p90_snr_db": p90_snr,
                 "mean_gossip_delivery_rate": mean_gossip_delivery,
+                "mean_gossip_loss_rate": mean_gossip_loss,
+                "p10_gossip_loss_rate": p10_gossip_loss,
+                "p90_gossip_loss_rate": p90_gossip_loss,
                 "mean_peer_age_s": mean_peer_age_s,
+                "p10_peer_age_s": p10_peer_age_s,
+                "p90_peer_age_s": p90_peer_age_s,
+                "mean_gossip_latency_ms": mean_gossip_latency_ms,
+                "p10_gossip_latency_ms": p10_gossip_latency_ms,
+                "p90_gossip_latency_ms": p90_gossip_latency_ms,
+                "mean_gossip_bitrate_bps": mean_gossip_bitrate_bps,
+                "p10_gossip_bitrate_bps": p10_gossip_bitrate_bps,
+                "p90_gossip_bitrate_bps": p90_gossip_bitrate_bps,
                 "example": example,
             }
     return summary
@@ -1204,6 +1362,9 @@ def save_collision_csv(summary, output_path):
             csv_file,
             fieldnames=[
                 "experiment",
+                "packet_profile",
+                "packet_bytes",
+                "encrypted",
                 "mitigation",
                 "trials",
                 "duration_s",
@@ -1218,35 +1379,61 @@ def save_collision_csv(summary, output_path):
                 "p10_min_separation_m",
                 "p90_min_separation_m",
                 "mean_gossip_delivery_rate",
+                "mean_gossip_loss_rate",
+                "p10_gossip_loss_rate",
+                "p90_gossip_loss_rate",
                 "mean_peer_age_s",
+                "p10_peer_age_s",
+                "p90_peer_age_s",
+                "mean_gossip_latency_ms",
+                "p10_gossip_latency_ms",
+                "p90_gossip_latency_ms",
+                "mean_gossip_bitrate_bps",
+                "p10_gossip_bitrate_bps",
+                "p90_gossip_bitrate_bps",
                 "operator_to_drone_freq_khz",
                 "drone_to_drone_freq_khz",
             ],
         )
         writer.writeheader()
-        for mitigation_name, metrics in summary["results"].items():
-            writer.writerow(
-                {
-                    "experiment": "collision_only_patrol",
-                    "mitigation": mitigation_name,
-                    "trials": summary["trials"],
-                    "duration_s": COLLISION_SIM_DURATION_S,
-                    "collision_threshold_m": COLLISION_RADIUS_M,
-                    "safe_separation_m": SAFE_SEPARATION_M,
-                    "cruise_speed_knots": CRUISE_SPEED_MPS / KNOT_TO_MPS,
-                    "collision_free_rate": metrics["collision_free_rate"],
-                    "collision_free_ci_low": metrics["collision_free_ci_low"],
-                    "collision_free_ci_high": metrics["collision_free_ci_high"],
-                    "mean_min_separation_m": metrics["mean_min_separation_m"],
-                    "p05_min_separation_m": metrics["p05_min_separation_m"],
-                    "p10_min_separation_m": metrics["p10_min_separation_m"],
-                    "p90_min_separation_m": metrics["p90_min_separation_m"],
-                    "mean_gossip_delivery_rate": metrics["mean_gossip_delivery_rate"],
-                    "mean_peer_age_s": metrics["mean_peer_age_s"],
-                    "operator_to_drone_freq_khz": OPERATOR_TO_DRONE_FREQ_KHZ,
-                    "drone_to_drone_freq_khz": DRONE_TO_DRONE_FREQ_KHZ,
-                }
-            )
+        for packet_name, packet_summary in summary.items():
+            for mitigation_name, metrics in packet_summary["results"].items():
+                writer.writerow(
+                    {
+                        "experiment": "collision_only_patrol",
+                        "packet_profile": packet_name,
+                        "packet_bytes": packet_summary["packet_bytes"],
+                        "encrypted": packet_summary["encrypted"],
+                        "mitigation": mitigation_name,
+                        "trials": packet_summary["trials"],
+                        "duration_s": COLLISION_SIM_DURATION_S,
+                        "collision_threshold_m": COLLISION_RADIUS_M,
+                        "safe_separation_m": SAFE_SEPARATION_M,
+                        "cruise_speed_knots": CRUISE_SPEED_MPS / KNOT_TO_MPS,
+                        "collision_free_rate": metrics["collision_free_rate"],
+                        "collision_free_ci_low": metrics["collision_free_ci_low"],
+                        "collision_free_ci_high": metrics["collision_free_ci_high"],
+                        "mean_min_separation_m": metrics["mean_min_separation_m"],
+                        "p05_min_separation_m": metrics["p05_min_separation_m"],
+                        "p10_min_separation_m": metrics["p10_min_separation_m"],
+                        "p90_min_separation_m": metrics["p90_min_separation_m"],
+                        "mean_gossip_delivery_rate": metrics["mean_gossip_delivery_rate"],
+                        "mean_gossip_loss_rate": metrics["mean_gossip_loss_rate"],
+                        "p10_gossip_loss_rate": metrics["p10_gossip_loss_rate"],
+                        "p90_gossip_loss_rate": metrics["p90_gossip_loss_rate"],
+                        "mean_peer_age_s": metrics["mean_peer_age_s"],
+                        "p10_peer_age_s": metrics["p10_peer_age_s"],
+                        "p90_peer_age_s": metrics["p90_peer_age_s"],
+                        "mean_gossip_latency_ms": metrics["mean_gossip_latency_ms"],
+                        "p10_gossip_latency_ms": metrics["p10_gossip_latency_ms"],
+                        "p90_gossip_latency_ms": metrics["p90_gossip_latency_ms"],
+                        "mean_gossip_bitrate_bps": metrics["mean_gossip_bitrate_bps"],
+                        "p10_gossip_bitrate_bps": metrics["p10_gossip_bitrate_bps"],
+                        "p90_gossip_bitrate_bps": metrics["p90_gossip_bitrate_bps"],
+                        "operator_to_drone_freq_khz": OPERATOR_TO_DRONE_FREQ_KHZ,
+                        "drone_to_drone_freq_khz": DRONE_TO_DRONE_FREQ_KHZ,
+                    }
+                )
 
 
 def save_mission_csv(summary, output_path):
@@ -1294,7 +1481,18 @@ def save_mission_csv(summary, output_path):
                 "p10_snr_db",
                 "p90_snr_db",
                 "mean_gossip_delivery_rate",
+                "mean_gossip_loss_rate",
+                "p10_gossip_loss_rate",
+                "p90_gossip_loss_rate",
                 "mean_peer_age_s",
+                "p10_peer_age_s",
+                "p90_peer_age_s",
+                "mean_gossip_latency_ms",
+                "p10_gossip_latency_ms",
+                "p90_gossip_latency_ms",
+                "mean_gossip_bitrate_bps",
+                "p10_gossip_bitrate_bps",
+                "p90_gossip_bitrate_bps",
                 "operator_range_min_m",
                 "operator_range_max_m",
                 "operator_to_drone_freq_khz",
@@ -1347,7 +1545,18 @@ def save_mission_csv(summary, output_path):
                         "p10_snr_db": metrics["p10_snr_db"],
                         "p90_snr_db": metrics["p90_snr_db"],
                         "mean_gossip_delivery_rate": metrics["mean_gossip_delivery_rate"],
+                        "mean_gossip_loss_rate": metrics["mean_gossip_loss_rate"],
+                        "p10_gossip_loss_rate": metrics["p10_gossip_loss_rate"],
+                        "p90_gossip_loss_rate": metrics["p90_gossip_loss_rate"],
                         "mean_peer_age_s": metrics["mean_peer_age_s"],
+                        "p10_peer_age_s": metrics["p10_peer_age_s"],
+                        "p90_peer_age_s": metrics["p90_peer_age_s"],
+                        "mean_gossip_latency_ms": metrics["mean_gossip_latency_ms"],
+                        "p10_gossip_latency_ms": metrics["p10_gossip_latency_ms"],
+                        "p90_gossip_latency_ms": metrics["p90_gossip_latency_ms"],
+                        "mean_gossip_bitrate_bps": metrics["mean_gossip_bitrate_bps"],
+                        "p10_gossip_bitrate_bps": metrics["p10_gossip_bitrate_bps"],
+                        "p90_gossip_bitrate_bps": metrics["p90_gossip_bitrate_bps"],
                         "operator_range_min_m": min_range_m,
                         "operator_range_max_m": max_range_m,
                         "operator_to_drone_freq_khz": OPERATOR_TO_DRONE_FREQ_KHZ,
@@ -1363,44 +1572,64 @@ def save_collision_png(summary, output_path):
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.8))
     fig.subplots_adjust(left=0.07, right=0.98, bottom=0.14, top=0.84, wspace=0.24)
 
+    packet_labels = list(summary.keys())
     mitigation_names = [BASELINE.name, MITIGATED.name]
     colors = {BASELINE.name: "#4A5568", MITIGATED.name: "#2B6CB0"}
-    x = np.arange(len(mitigation_names))
-    collision_rates = [summary["results"][name]["collision_free_rate"] for name in mitigation_names]
-    lower_err = [
-        max(0.0, summary["results"][name]["collision_free_rate"] - summary["results"][name]["collision_free_ci_low"])
-        for name in mitigation_names
-    ]
-    upper_err = [
-        max(0.0, summary["results"][name]["collision_free_ci_high"] - summary["results"][name]["collision_free_rate"])
-        for name in mitigation_names
-    ]
+    x = np.arange(len(packet_labels))
+    width = 0.34
+
+    def metric_values(metric_name, mitigation_name):
+        return [summary[label]["results"][mitigation_name][metric_name] for label in packet_labels]
+
+    def ci_error(rate_name, low_name, high_name, mitigation_name):
+        means = np.array(metric_values(rate_name, mitigation_name))
+        lows = np.array(metric_values(low_name, mitigation_name))
+        highs = np.array(metric_values(high_name, mitigation_name))
+        return np.vstack([np.maximum(0.0, means - lows), np.maximum(0.0, highs - means)])
+
     axes[0].bar(
-        x,
-        collision_rates,
-        color=[colors[name] for name in mitigation_names],
-        width=0.55,
-        yerr=np.vstack([lower_err, upper_err]),
+        x - width / 2.0,
+        metric_values("collision_free_rate", BASELINE.name),
+        color=colors[BASELINE.name],
+        width=width,
+        yerr=ci_error("collision_free_rate", "collision_free_ci_low", "collision_free_ci_high", BASELINE.name),
+        capsize=6,
+        ecolor="#1A202C",
+    )
+    axes[0].bar(
+        x + width / 2.0,
+        metric_values("collision_free_rate", MITIGATED.name),
+        color=colors[MITIGATED.name],
+        width=width,
+        yerr=ci_error("collision_free_rate", "collision_free_ci_low", "collision_free_ci_high", MITIGATED.name),
         capsize=6,
         ecolor="#1A202C",
     )
     axes[0].set_ylim(0.0, 1.05)
-    axes[0].set_xticks(x, ["No mitigation", "Hop + redundancy"], rotation=8)
+    axes[0].set_xticks(x, packet_labels, rotation=12)
     axes[0].set_ylabel("Fraction of trials")
     axes[0].set_title("Collision-Free Patrol Rate", pad=10)
-    for idx, mitigation_name in enumerate(mitigation_names):
-        metrics = summary["results"][mitigation_name]
-        axes[0].text(
-            idx,
-            min(1.02, collision_rates[idx] + 0.06),
-            f"{metrics['collision_free_rate']:.2f}\n[{metrics['collision_free_ci_low']:.2f}, {metrics['collision_free_ci_high']:.2f}]",
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
+    for packet_idx, packet_name in enumerate(packet_labels):
+        for x_pos, mitigation_name in (
+            (packet_idx - width / 2.0, BASELINE.name),
+            (packet_idx + width / 2.0, MITIGATED.name),
+        ):
+            metrics = summary[packet_name]["results"][mitigation_name]
+            axes[0].text(
+                x_pos,
+                min(1.02, metrics["collision_free_rate"] + 0.06),
+                f"{metrics['collision_free_rate']:.2f}\n[{metrics['collision_free_ci_low']:.2f}, {metrics['collision_free_ci_high']:.2f}]",
+                ha="center",
+                va="bottom",
+                fontsize=8.6,
+            )
 
     all_min_seps = np.concatenate(
-        [np.array([result.min_separation_m for result in summary["results"][name]["results"]], dtype=float) for name in mitigation_names]
+        [
+            np.array([result.min_separation_m for result in summary[packet_name]["results"][mitigation_name]["results"]], dtype=float)
+            for packet_name in packet_labels
+            for mitigation_name in mitigation_names
+        ]
     )
     plot_min = float(np.min(all_min_seps))
     plot_max = float(np.max(all_min_seps))
@@ -1410,12 +1639,16 @@ def save_collision_png(summary, output_path):
     view_max = plot_max + padding
     axes[1].axvline(COLLISION_RADIUS_M, color="#1A202C", linewidth=1.6, linestyle=":")
     jitter_rng = np.random.default_rng(SEED + 101)
-    y_positions = {BASELINE.name: 0.70, MITIGATED.name: 0.35}
+    row_specs = [
+        ("32 B clear", BASELINE.name, 0.82),
+        ("32 B clear", MITIGATED.name, 0.62),
+        ("64 B encrypted", BASELINE.name, 0.38),
+        ("64 B encrypted", MITIGATED.name, 0.18),
+    ]
     summary_lines = []
-    for mitigation_name in mitigation_names:
-        metrics = summary["results"][mitigation_name]
+    for packet_name, mitigation_name, y_pos in row_specs:
+        metrics = summary[packet_name]["results"][mitigation_name]
         min_seps = np.array([result.min_separation_m for result in metrics["results"]], dtype=float)
-        y_pos = y_positions[mitigation_name]
         axes[1].plot(
             [metrics["p10_min_separation_m"], metrics["p90_min_separation_m"]],
             [y_pos, y_pos],
@@ -1429,7 +1662,7 @@ def save_collision_png(summary, output_path):
             min_seps,
             vert=False,
             positions=[y_pos],
-            widths=0.18,
+            widths=0.12,
             patch_artist=True,
             manage_ticks=False,
             boxprops=dict(facecolor=colors[mitigation_name], edgecolor=colors[mitigation_name], linewidth=1.2, alpha=0.20),
@@ -1438,11 +1671,11 @@ def save_collision_png(summary, output_path):
             medianprops=dict(color="#1A202C", linewidth=1.4),
             flierprops=dict(marker="o", markersize=0),
         )
-        y_jitter = y_pos + jitter_rng.uniform(-0.08, 0.08, size=len(min_seps))
+        y_jitter = y_pos + jitter_rng.uniform(-0.05, 0.05, size=len(min_seps))
         axes[1].scatter(
             min_seps,
             y_jitter,
-            s=26,
+            s=24,
             color=colors[mitigation_name],
             edgecolor="white",
             linewidth=0.40,
@@ -1450,13 +1683,15 @@ def save_collision_png(summary, output_path):
             zorder=3,
         )
         summary_lines.append(
-            f"{'Base' if mitigation_name == BASELINE.name else 'Mitigated'}: "
-            f"mean {metrics['mean_min_separation_m']:.1f} m | 5th pct {metrics['p05_min_separation_m']:.1f} m"
+            f"{packet_name}, {'Base' if mitigation_name == BASELINE.name else 'Mitigated'}: "
+            f"{metrics['mean_min_separation_m']:.1f} m mean | {metrics['p05_min_separation_m']:.1f} m 5th pct"
         )
     axes[1].set_xlim(view_min, view_max)
-    axes[1].set_ylim(0.15, 0.90)
-    axes[1].set_yticks([y_positions[BASELINE.name], y_positions[MITIGATED.name]])
-    axes[1].set_yticklabels(["No mitigation", "Hop + redundancy"])
+    axes[1].set_ylim(0.08, 0.92)
+    axes[1].set_yticks([0.82, 0.62, 0.38, 0.18])
+    axes[1].set_yticklabels(
+        ["32 B | No mitigation", "32 B | Hop + redundancy", "64 B | No mitigation", "64 B | Hop + redundancy"]
+    )
     axes[1].set_xlabel("Minimum pairwise separation (m)")
     axes[1].set_title("Closest Approach Distribution (zoomed)", pad=10)
     axes[1].text(
@@ -1467,11 +1702,24 @@ def save_collision_png(summary, output_path):
         transform=axes[1].transAxes,
         va="top",
         ha="left",
-        fontsize=9.5,
+        fontsize=8.4,
         bbox=dict(boxstyle="round,pad=0.28", facecolor="white", edgecolor="#CBD5E0", alpha=0.95),
     )
 
-    fig.suptitle("Five-Drone Collision Monte Carlo Over Six Hours | Baseline vs Mitigated Swarm Gossip", fontsize=16, y=0.975)
+    legend_handles = [
+        plt.Rectangle((0, 0), 1, 1, color=colors[BASELINE.name]),
+        plt.Rectangle((0, 0), 1, 1, color=colors[MITIGATED.name]),
+    ]
+    fig.legend(
+        legend_handles,
+        [BASELINE.name, MITIGATED.name],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.91),
+        ncols=2,
+        frameon=False,
+        fontsize=10,
+    )
+    fig.suptitle("Five-Drone Collision Monte Carlo Over Six Hours | 32 B clear vs 64 B encrypted", fontsize=16, y=0.975)
     fig.savefig(output_path, dpi=220)
     plt.close(fig)
 
@@ -1614,6 +1862,150 @@ def save_mission_metrics_png(summary, output_path):
     plt.close(fig)
 
 
+def save_gossip_metrics_png(summary, output_path):
+    plt.style.use("seaborn-v0_8-whitegrid")
+    labels = list(summary.keys())
+    x = np.arange(len(labels))
+    width = 0.34
+    baseline_color = "#4A5568"
+    mitigated_color = "#2B6CB0"
+
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.4))
+    fig.subplots_adjust(left=0.07, right=0.98, bottom=0.10, top=0.80, wspace=0.24, hspace=0.34)
+
+    def metric_values(metric_name, mitigation_name):
+        return [summary[label]["results"][mitigation_name][metric_name] for label in labels]
+
+    def percentile_error(metric_name, low_name, high_name, mitigation_name):
+        means = np.array(metric_values(metric_name, mitigation_name))
+        lows = np.array(metric_values(low_name, mitigation_name))
+        highs = np.array(metric_values(high_name, mitigation_name))
+        return np.vstack([np.maximum(0.0, means - lows), np.maximum(0.0, highs - means)])
+
+    axes[0, 0].bar(
+        x - width / 2.0,
+        metric_values("mean_gossip_loss_rate", BASELINE.name),
+        width=width,
+        color=baseline_color,
+        yerr=percentile_error("mean_gossip_loss_rate", "p10_gossip_loss_rate", "p90_gossip_loss_rate", BASELINE.name),
+        capsize=5,
+        ecolor="#1A202C",
+    )
+    axes[0, 0].bar(
+        x + width / 2.0,
+        metric_values("mean_gossip_loss_rate", MITIGATED.name),
+        width=width,
+        color=mitigated_color,
+        yerr=percentile_error("mean_gossip_loss_rate", "p10_gossip_loss_rate", "p90_gossip_loss_rate", MITIGATED.name),
+        capsize=5,
+        ecolor="#1A202C",
+    )
+    axes[0, 0].set_ylim(0.0, 1.05)
+    axes[0, 0].set_xticks(x, labels, rotation=12)
+    axes[0, 0].set_title("Gossip Packet Loss", pad=10)
+
+    axes[0, 1].bar(
+        x - width / 2.0,
+        metric_values("mean_gossip_latency_ms", BASELINE.name),
+        width=width,
+        color=baseline_color,
+        yerr=percentile_error("mean_gossip_latency_ms", "p10_gossip_latency_ms", "p90_gossip_latency_ms", BASELINE.name),
+        capsize=5,
+        ecolor="#1A202C",
+    )
+    axes[0, 1].bar(
+        x + width / 2.0,
+        metric_values("mean_gossip_latency_ms", MITIGATED.name),
+        width=width,
+        color=mitigated_color,
+        yerr=percentile_error("mean_gossip_latency_ms", "p10_gossip_latency_ms", "p90_gossip_latency_ms", MITIGATED.name),
+        capsize=5,
+        ecolor="#1A202C",
+    )
+    axes[0, 1].set_xticks(x, labels, rotation=12)
+    axes[0, 1].set_ylabel("Latency (ms)")
+    axes[0, 1].set_title("Gossip One-Way Latency", pad=10)
+
+    baseline_bitrate_kbps = np.array(metric_values("mean_gossip_bitrate_bps", BASELINE.name)) / 1000.0
+    mitigated_bitrate_kbps = np.array(metric_values("mean_gossip_bitrate_bps", MITIGATED.name)) / 1000.0
+    baseline_bitrate_error = percentile_error(
+        "mean_gossip_bitrate_bps", "p10_gossip_bitrate_bps", "p90_gossip_bitrate_bps", BASELINE.name
+    ) / 1000.0
+    mitigated_bitrate_error = percentile_error(
+        "mean_gossip_bitrate_bps", "p10_gossip_bitrate_bps", "p90_gossip_bitrate_bps", MITIGATED.name
+    ) / 1000.0
+    axes[1, 0].bar(
+        x - width / 2.0,
+        baseline_bitrate_kbps,
+        width=width,
+        color=baseline_color,
+        yerr=baseline_bitrate_error,
+        capsize=5,
+        ecolor="#1A202C",
+    )
+    axes[1, 0].bar(
+        x + width / 2.0,
+        mitigated_bitrate_kbps,
+        width=width,
+        color=mitigated_color,
+        yerr=mitigated_bitrate_error,
+        capsize=5,
+        ecolor="#1A202C",
+    )
+    axes[1, 0].set_xticks(x, labels, rotation=12)
+    axes[1, 0].set_ylabel("Bitrate (kbps)")
+    axes[1, 0].set_title("Aggregate Gossip Bitrate", pad=10)
+
+    baseline_peer_age_ms = np.array(metric_values("mean_peer_age_s", BASELINE.name)) * MS_PER_SECOND
+    mitigated_peer_age_ms = np.array(metric_values("mean_peer_age_s", MITIGATED.name)) * MS_PER_SECOND
+    baseline_peer_age_error = percentile_error("mean_peer_age_s", "p10_peer_age_s", "p90_peer_age_s", BASELINE.name) * MS_PER_SECOND
+    mitigated_peer_age_error = percentile_error("mean_peer_age_s", "p10_peer_age_s", "p90_peer_age_s", MITIGATED.name) * MS_PER_SECOND
+    axes[1, 1].bar(
+        x - width / 2.0,
+        baseline_peer_age_ms,
+        width=width,
+        color=baseline_color,
+        yerr=baseline_peer_age_error,
+        capsize=5,
+        ecolor="#1A202C",
+    )
+    axes[1, 1].bar(
+        x + width / 2.0,
+        mitigated_peer_age_ms,
+        width=width,
+        color=mitigated_color,
+        yerr=mitigated_peer_age_error,
+        capsize=5,
+        ecolor="#1A202C",
+    )
+    axes[1, 1].set_xticks(x, labels, rotation=12)
+    axes[1, 1].set_ylabel("Age (ms)")
+    axes[1, 1].set_title("Peer-State Age", pad=10)
+
+    legend_handles = [
+        plt.Rectangle((0, 0), 1, 1, color=baseline_color),
+        plt.Rectangle((0, 0), 1, 1, color=mitigated_color),
+    ]
+    fig.legend(
+        legend_handles,
+        [BASELINE.name, MITIGATED.name],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.905),
+        ncols=2,
+        frameon=False,
+        fontsize=10,
+    )
+    fig.suptitle(
+        "Drone-to-Drone Gossip Metrics | 32 B clear vs 64 B encrypted\n"
+        f"Swarm baseline {DRONE_TO_DRONE_FREQ_KHZ:.0f} kHz | Hop pairs include {DRONE_HOP_PAIRS_KHZ[1][0]:.0f}/{DRONE_HOP_PAIRS_KHZ[1][1]:.0f} kHz | "
+        "One-way state updates",
+        fontsize=15,
+        y=0.975,
+    )
+    fig.savefig(output_path, dpi=220)
+    plt.close(fig)
+
+
 def plot_sample_tracks(ax, track_samples, center_path, title):
     colors = ["#1F4E79", "#2F855A", "#C05621", "#805AD5", "#C53030"]
     for drone_idx in range(NUM_DRONES):
@@ -1691,15 +2083,15 @@ def save_track_png(collision_summary, mission_summary, output_path):
 
     plot_sample_tracks(
         axes[0, 0],
-        collision_summary["results"][BASELINE.name]["example"].track_samples,
+        collision_summary["64 B encrypted"]["results"][BASELINE.name]["example"].track_samples,
         COLLISION_PATROL_CENTERS,
-        "Collision-only | No mitigation",
+        "Collision-only | 64 B encrypted | No mitigation",
     )
     plot_sample_tracks(
         axes[0, 1],
-        collision_summary["results"][MITIGATED.name]["example"].track_samples,
+        collision_summary["64 B encrypted"]["results"][MITIGATED.name]["example"].track_samples,
         COLLISION_PATROL_CENTERS,
-        "Collision-only | Hop + redundancy",
+        "Collision-only | 64 B encrypted | Hop + redundancy",
     )
     plot_sample_tracks(
         axes[0, 2],
@@ -1768,19 +2160,21 @@ def print_summary(collision_summary, mission_summary):
     print(f"Mission shadowing: trial mean sampled uniformly from {MISSION_SHADOW_MEAN_DB_MIN:.1f} dB to {MISSION_SHADOW_MEAN_DB_MAX:.1f} dB")
     print()
     print("Experiment 1: collision-only autonomous patrol over 6 hours")
-    print(f"  trials={collision_summary['trials']}")
-    for mitigation_name in [BASELINE.name, MITIGATED.name]:
-        metrics = collision_summary["results"][mitigation_name]
-        print(
-            f"    {mitigation_name:26s}"
-            f" collision_free_rate={metrics['collision_free_rate']:.3f}"
-            f" ci95=[{metrics['collision_free_ci_low']:.3f},{metrics['collision_free_ci_high']:.3f}]"
-            f" mean_min_separation={metrics['mean_min_separation_m']:.1f}m"
-            f" p10-p90=[{metrics['p10_min_separation_m']:.1f},{metrics['p90_min_separation_m']:.1f}]m"
-            f" p05_min_separation={metrics['p05_min_separation_m']:.1f}m"
-            f" gossip_delivery={metrics['mean_gossip_delivery_rate']:.3f}"
-            f" mean_peer_age={metrics['mean_peer_age_s']:.1f}s"
-        )
+    for packet_name, packet_summary in collision_summary.items():
+        print(f"  Packet profile: {packet_name} | trials={packet_summary['trials']}")
+        for mitigation_name in [BASELINE.name, MITIGATED.name]:
+            metrics = packet_summary["results"][mitigation_name]
+            print(
+                f"    {mitigation_name:26s}"
+                f" collision_free_rate={metrics['collision_free_rate']:.3f}"
+                f" ci95=[{metrics['collision_free_ci_low']:.3f},{metrics['collision_free_ci_high']:.3f}]"
+                f" mean_min_separation={metrics['mean_min_separation_m']:.1f}m"
+                f" p10-p90=[{metrics['p10_min_separation_m']:.1f},{metrics['p90_min_separation_m']:.1f}]m"
+                f" p05_min_separation={metrics['p05_min_separation_m']:.1f}m"
+                f" gossip_delivery={metrics['mean_gossip_delivery_rate']:.3f}"
+                f" gossip_latency={metrics['mean_gossip_latency_ms']:.0f}ms"
+                f" mean_peer_age={metrics['mean_peer_age_s']:.1f}s"
+            )
     print()
     print("Experiment 2: operator sends 5 sequential waypoints with representative SYN/ACK handshakes")
     for packet_name, packet_summary in mission_summary.items():
@@ -1798,12 +2192,14 @@ def print_summary(collision_summary, mission_summary):
                 f" arrival_rtt={metrics['mean_arrival_latency_ms']:.0f}ms"
                 f" retries_per_waypoint={metrics['mean_retries_per_waypoint']:.2f}"
                 f" gossip_delivery={metrics['mean_gossip_delivery_rate']:.3f}"
+                f" gossip_latency={metrics['mean_gossip_latency_ms']:.0f}ms"
                 f" mean_peer_age={metrics['mean_peer_age_s']:.1f}s"
             )
     print()
     print("Saved figures:")
     print("  fleet_collision_summary.png")
     print("  fleet_mission_metrics.png")
+    print("  fleet_gossip_metrics.png")
     print("  fleet_motion_tracks.png")
     print("Saved CSV:")
     print("  fleet_collision_summary.csv")
@@ -1865,6 +2261,7 @@ def main():
 
     save_collision_png(collision_summary, os.path.join(output_dir, "fleet_collision_summary.png"))
     save_mission_metrics_png(mission_summary, os.path.join(output_dir, "fleet_mission_metrics.png"))
+    save_gossip_metrics_png(mission_summary, os.path.join(output_dir, "fleet_gossip_metrics.png"))
     save_track_png(collision_summary, mission_summary, os.path.join(output_dir, "fleet_motion_tracks.png"))
     save_collision_csv(collision_summary, os.path.join(output_dir, "fleet_collision_summary.csv"))
     save_mission_csv(mission_summary, os.path.join(output_dir, "fleet_mission_summary.csv"))
