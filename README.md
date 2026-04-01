@@ -1,3 +1,4 @@
+DISCLAIMER: Written with the help of Codex.
 # Underwater Acoustic Fleet Simulation
 
 This project simulates a five-drone underwater fleet with one remote human operator.
