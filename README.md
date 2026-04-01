@@ -19,6 +19,9 @@ The simulator focuses on two experiments:
 - One fixed operator modem.
 - Operator-to-drone acoustic link at `28 kHz`.
 - Drone-to-drone gossip / coordination link at `50 kHz`.
+- Separate modem rates by link:
+  - operator link at `5120 bps`
+  - swarm gossip link at `10240 bps`
 - Two packet sizes:
   - `32 B clear`
   - `64 B encrypted` (`32 B` packet plus `32 B` encryption overhead)
@@ -36,6 +39,7 @@ The simulator focuses on two experiments:
 - Occasional wideband bad fades.
 - Narrowband fades that make hopping and frequency diversity matter.
 - Packet airtime and latency from propagation plus transmit time.
+- Different airtime on the operator and swarm links because the modem rates are different.
 - Packet error probability from an SNR -> BER -> PER approximation.
 - Parallel frequency-diverse packet copies for the mitigated case.
 - Stop-and-wait command / arrival handshakes with retries and backoff.
@@ -69,6 +73,13 @@ The nominal formation is a compact cross around the center waypoint path, and th
 - fall back to a close-range local repulsion term if needed
 
 The collision-endurance patrol uses a gentler loiter path than the operator mission. That is intentional. It is meant to test whether the swarm can remain coherent and avoid collisions over long duration, not whether it can survive the sharpest possible turns for six hours straight.
+
+The collision study now uses the same packet-size sweep as the mission study:
+
+- `32 B clear`
+- `64 B encrypted`
+
+That keeps the comparison internally consistent across operator traffic and swarm gossip, even though the realistic deployed case is likely the `64 B encrypted` profile.
 
 ## How The Mitigation Works
 
@@ -113,6 +124,7 @@ That means the swarm does not steer on perfect truth unless peers are very close
 Purpose:
 
 - Measure whether the five-drone swarm stays collision-free over `6 hours`.
+- Compare `32 B clear` and `64 B encrypted` gossip traffic under both mitigation modes.
 
 Key outputs:
 
@@ -120,6 +132,9 @@ Key outputs:
 - minimum pairwise separation
 - closest-approach distribution
 - gossip delivery rate
+- gossip packet loss
+- gossip one-way latency
+- aggregate gossip bitrate
 - peer-state age
 
 ### 2. Operator-Controlled Five-Waypoint Mission
@@ -210,6 +225,7 @@ The simulator writes results next to the script:
 
 - `fleet_collision_summary.png`
 - `fleet_mission_metrics.png`
+- `fleet_gossip_metrics.png`
 - `fleet_motion_tracks.png`
 - `fleet_collision_summary.csv`
 - `fleet_mission_summary.csv`
@@ -219,4 +235,5 @@ The simulator writes results next to the script:
 - If mission success stays high while latency and retries rise, the link is degraded but still operationally usable.
 - If packet loss and retries rise enough that completed waypoints drop, the operator link is what is breaking the mission.
 - If collision-free patrol rate falls, the swarm-coordination link or control law is not robust enough for the tested formation density and path geometry.
+- The `fleet_gossip_metrics.png` figure is the swarm-link companion to the operator mission dashboard: it compares `32 B` vs `64 B` and mitigation vs no mitigation for packet loss, one-way latency, aggregate bitrate, and peer-state age.
 - A slightly smaller closest-approach value under mitigation does not automatically mean mitigation is worse. Better gossip can let the swarm hold a tighter intended formation more accurately.
