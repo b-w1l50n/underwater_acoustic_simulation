@@ -41,17 +41,19 @@ TRACK_SAMPLE_EVERY_STEPS = 15
 CRUISE_SPEED_MPS = 3.0 * KNOT_TO_MPS
 MAX_ACCEL_MPS2 = 0.20
 WAYPOINT_HIT_RADIUS_M = 10.0
-COLLISION_RADIUS_M = 8.0
-SAFE_SEPARATION_M = 12.0
+COLLISION_RADIUS_M = 1.0
+SAFE_SEPARATION_M = 8.0
 AVOIDANCE_GAIN = 5.0
-LOCAL_PROXIMITY_THRESHOLD_M = 10.0
-LOCAL_PROXIMITY_GAIN = 8.0
+LOCAL_PROXIMITY_THRESHOLD_M = 5.0
+LOCAL_PROXIMITY_GAIN = 12.0
+NOMINAL_SPACING_M = 7.0
 DEAD_RECKONING_HORIZON_S = 12.0
 MOTION_NOISE_STD_M = 0.03
 GOSSIP_PACKET_BYTES = 32
 GOSSIP_SENDERS_PER_STEP = 5
 GOSSIP_ACCESS_MISS_PROB = 0.01
 FREQUENCY_DIVERSITY_OFFSETS_KHZ = (-2.0, 2.0)
+COMMAND_REQUEST_INTERVAL_S = 15.0
 
 OPERATOR_DATA_RATE_BPS = 5120.0
 SWARM_DATA_RATE_BPS = 10240.0
@@ -77,6 +79,16 @@ NARROWBAND_FADE_PROB = 0.16
 NARROWBAND_FADE_DB_MIN = 8.0
 NARROWBAND_FADE_DB_MAX = 18.0
 NARROWBAND_FADE_WIDTH_KHZ = 1.0
+OPERATOR_TRANSIENT_FADE_TRIGGER_PROB = 0.04
+SWARM_TRANSIENT_FADE_TRIGGER_PROB = 0.025
+TRANSIENT_FADE_DURATION_MIN_S = 2.0
+TRANSIENT_FADE_DURATION_MAX_S = 5.0
+TRANSIENT_FADE_COOLDOWN_SCALE_MIN = 0.5
+TRANSIENT_FADE_COOLDOWN_SCALE_MAX = 2.0
+OPERATOR_TRANSIENT_FADE_BIAS_DB_MIN = 7.0
+OPERATOR_TRANSIENT_FADE_BIAS_DB_MAX = 14.0
+SWARM_TRANSIENT_FADE_BIAS_DB_MIN = 4.0
+SWARM_TRANSIENT_FADE_BIAS_DB_MAX = 9.0
 LATENCY_JITTER_MIN = 0.90
 LATENCY_JITTER_MAX = 1.30
 MISSION_SHADOW_MEAN_DB_MIN = 6.0
@@ -86,10 +98,10 @@ OPERATOR_POS = np.array([-1000.0, 0.0, 0.0])
 
 FORMATION_OFFSETS = np.array(
     [
-        [-10.0, 0.0, 0.0],
-        [10.0, 0.0, 0.0],
-        [0.0, -10.0, 0.0],
-        [0.0, 10.0, 0.0],
+        [-NOMINAL_SPACING_M, 0.0, 0.0],
+        [NOMINAL_SPACING_M, 0.0, 0.0],
+        [0.0, -NOMINAL_SPACING_M, 0.0],
+        [0.0, NOMINAL_SPACING_M, 0.0],
         [0.0, 0.0, 0.0],
     ]
 )
@@ -218,6 +230,14 @@ class SwarmBeliefState:
     next_sender_idx: int
 
 
+@dataclass
+class TransientFadeState:
+    bias_db: float = 0.0
+    degraded_remaining_s: float = 0.0
+    pending_cooldown_s: float = 0.0
+    cooldown_remaining_s: float = 0.0
+
+
 TRIAL_PRESETS = {
     "low": TrialPreset(name="low", collision_trials=LOW_COLLISION_TRIALS, mission_trials=LOW_MISSION_TRIALS),
     "high": TrialPreset(name="high", collision_trials=HIGH_COLLISION_TRIALS, mission_trials=HIGH_MISSION_TRIALS),
@@ -282,9 +302,8 @@ def safe_unit_rows(array):
     return np.divide(array, np.maximum(magnitudes, 1e-9), out=np.zeros_like(array), where=magnitudes > 1e-9)
 
 
-def pairwise_min_separation_xy(positions):
-    xy = positions[:, :2]
-    deltas = xy[:, None, :] - xy[None, :, :]
+def pairwise_min_separation(positions):
+    deltas = positions[:, None, :] - positions[None, :, :]
     distances = np.linalg.norm(deltas, axis=2)
     upper_indices = np.triu_indices(NUM_DRONES, k=1)
     return float(np.min(distances[upper_indices]))
@@ -307,7 +326,7 @@ def init_swarm_belief_state(positions, velocities):
     )
 
 
-def update_swarm_beliefs(positions, velocities, belief_state, environment, mitigation, packet_bytes, trial_rng):
+def update_swarm_beliefs(positions, velocities, belief_state, environment, mitigation, packet_bytes, trial_rng, swarm_link_state):
     belief_state.peer_age_s += DT
     diag_idx = np.arange(NUM_DRONES)
     belief_state.perceived_positions[diag_idx, diag_idx] = positions
@@ -320,6 +339,7 @@ def update_swarm_beliefs(positions, velocities, belief_state, environment, mitig
     transmitted_bits_sum = 0.0
     access_miss_prob = GOSSIP_ACCESS_MISS_PROB
     packet_bytes_on_air = effective_packet_bytes(packet_bytes, mitigation)
+    gossip_slot_elapsed_s = DT / max(GOSSIP_SENDERS_PER_STEP * (NUM_DRONES - 1), 1)
 
     for slot_idx in range(GOSSIP_SENDERS_PER_STEP):
         sender_idx = (belief_state.next_sender_idx + slot_idx) % NUM_DRONES
@@ -330,6 +350,7 @@ def update_swarm_beliefs(positions, velocities, belief_state, environment, mitig
                 continue
             tx_count += 1
             if trial_rng.random() < access_miss_prob:
+                advance_transient_fade_state(swarm_link_state, gossip_slot_elapsed_s)
                 continue
             gossip = transmit_packet(
                 sender_pos,
@@ -341,6 +362,7 @@ def update_swarm_beliefs(positions, velocities, belief_state, environment, mitig
                 mitigation,
                 trial_rng,
                 DRONE_TO_DRONE_FREQ_KHZ,
+                swarm_link_state,
             )
             transmitted_bits_sum += gossip.transmissions * packet_bytes_on_air * 8.0
             if gossip.success:
@@ -349,6 +371,7 @@ def update_swarm_beliefs(positions, velocities, belief_state, environment, mitig
                 belief_state.peer_age_s[receiver_idx, sender_idx] = 0.0
                 success_count += 1
                 successful_latency_sum_s += gossip.latency_s
+            advance_transient_fade_state(swarm_link_state, gossip_slot_elapsed_s)
 
     belief_state.next_sender_idx = (belief_state.next_sender_idx + GOSSIP_SENDERS_PER_STEP) % NUM_DRONES
     return tx_count, success_count, successful_latency_sum_s, transmitted_bits_sum
@@ -416,6 +439,63 @@ def data_rate_bps_for_freq(freq_khz):
     if abs(freq_khz - OPERATOR_TO_DRONE_FREQ_KHZ) <= abs(freq_khz - DRONE_TO_DRONE_FREQ_KHZ):
         return OPERATOR_DATA_RATE_BPS
     return SWARM_DATA_RATE_BPS
+
+
+def transient_fade_parameters(freq_khz):
+    if abs(freq_khz - OPERATOR_TO_DRONE_FREQ_KHZ) <= abs(freq_khz - DRONE_TO_DRONE_FREQ_KHZ):
+        return (
+            OPERATOR_TRANSIENT_FADE_TRIGGER_PROB,
+            OPERATOR_TRANSIENT_FADE_BIAS_DB_MIN,
+            OPERATOR_TRANSIENT_FADE_BIAS_DB_MAX,
+        )
+    return (
+        SWARM_TRANSIENT_FADE_TRIGGER_PROB,
+        SWARM_TRANSIENT_FADE_BIAS_DB_MIN,
+        SWARM_TRANSIENT_FADE_BIAS_DB_MAX,
+    )
+
+
+def advance_transient_fade_state(link_state, elapsed_s):
+    remaining = max(0.0, elapsed_s)
+    while remaining > 1e-9:
+        if link_state.degraded_remaining_s > 0.0:
+            step = min(remaining, link_state.degraded_remaining_s)
+            link_state.degraded_remaining_s -= step
+            remaining -= step
+            if link_state.degraded_remaining_s <= 1e-9:
+                link_state.degraded_remaining_s = 0.0
+                link_state.bias_db = 0.0
+                if link_state.pending_cooldown_s > 0.0:
+                    link_state.cooldown_remaining_s = link_state.pending_cooldown_s
+                    link_state.pending_cooldown_s = 0.0
+            continue
+
+        if link_state.cooldown_remaining_s > 0.0:
+            step = min(remaining, link_state.cooldown_remaining_s)
+            link_state.cooldown_remaining_s -= step
+            remaining -= step
+            if link_state.cooldown_remaining_s <= 1e-9:
+                link_state.cooldown_remaining_s = 0.0
+            continue
+
+        break
+
+
+def sample_transient_fade_bias_db(link_state, freq_khz, trial_rng):
+    if link_state.degraded_remaining_s <= 0.0 and link_state.cooldown_remaining_s <= 0.0 and link_state.pending_cooldown_s <= 0.0:
+        trigger_prob, bias_min_db, bias_max_db = transient_fade_parameters(freq_khz)
+        if trial_rng.random() < trigger_prob:
+            degraded_duration_s = trial_rng.uniform(TRANSIENT_FADE_DURATION_MIN_S, TRANSIENT_FADE_DURATION_MAX_S)
+            link_state.bias_db = trial_rng.uniform(bias_min_db, bias_max_db)
+            link_state.degraded_remaining_s = degraded_duration_s
+            link_state.pending_cooldown_s = trial_rng.uniform(
+                TRANSIENT_FADE_COOLDOWN_SCALE_MIN * degraded_duration_s,
+                TRANSIENT_FADE_COOLDOWN_SCALE_MAX * degraded_duration_s,
+            )
+
+    if link_state.degraded_remaining_s > 0.0:
+        return link_state.bias_db * trial_rng.uniform(0.75, 1.05)
+    return 0.0
 
 
 def multipath_penalty_db(range_m, tx_depth_m, rx_depth_m, environment, freq_khz):
@@ -509,15 +589,13 @@ def narrowband_penalty_db(copy_freq_khz, notch_center_khz, notch_depth_db):
     return notch_depth_db * math.exp(-0.5 * normalized_offset * normalized_offset)
 
 
-def transmit_packet(tx_pos, rx_pos, tx_vel, rx_vel, packet_bytes, environment, mitigation, trial_rng, freq_khz):
+def transmit_packet(tx_pos, rx_pos, tx_vel, rx_vel, packet_bytes, environment, mitigation, trial_rng, freq_khz, link_fade_state=None):
     packet_bytes = effective_packet_bytes(packet_bytes, mitigation)
     copy_freqs_khz = packet_copy_frequencies_khz(freq_khz, mitigation, trial_rng)
     best_snr_db = -1e9
     parallel_copies = len(copy_freqs_khz)
     common_shadow_db = max(0.0, trial_rng.normal(environment.comm_shadow_mean_db, SHADOWING_SIGMA_DB))
-    wideband_bad_fade_db = 0.0
-    if trial_rng.random() < BAD_FADE_PROB:
-        wideband_bad_fade_db = trial_rng.uniform(BAD_FADE_DB_MIN, BAD_FADE_DB_MAX)
+    transient_bias_db = sample_transient_fade_bias_db(link_fade_state, freq_khz, trial_rng) if link_fade_state is not None else 0.0
     notch_center_khz, notch_depth_db = sample_narrowband_notch(freq_khz, trial_rng)
     success_latencies = []
     last_latency_s = 0.0
@@ -525,7 +603,7 @@ def transmit_packet(tx_pos, rx_pos, tx_vel, rx_vel, packet_bytes, environment, m
     for copy_freq_khz in copy_freqs_khz:
         selective_fade_db = max(0.0, trial_rng.normal(0.0, 1.1))
         frequency_selective_db = narrowband_penalty_db(copy_freq_khz, notch_center_khz, notch_depth_db)
-        fading_db = common_shadow_db + wideband_bad_fade_db + selective_fade_db + frequency_selective_db
+        fading_db = common_shadow_db + transient_bias_db + selective_fade_db + frequency_selective_db
         snr_db, range_m = link_snr_db(tx_pos, rx_pos, tx_vel, rx_vel, environment, fading_db, copy_freq_khz)
         per = packet_error_rate(snr_db, packet_bytes)
         data_rate_bps = data_rate_bps_for_freq(copy_freq_khz)
@@ -551,6 +629,7 @@ def step_fleet(
     positions,
     velocities,
     belief_state,
+    swarm_link_state,
     control_bias,
     current_vector,
     center_target,
@@ -568,6 +647,7 @@ def step_fleet(
         mitigation,
         gossip_packet_bytes,
         trial_rng,
+        swarm_link_state,
     )
     targets = center_target + FORMATION_OFFSETS
     target_errors = targets - positions
@@ -581,39 +661,38 @@ def step_fleet(
 
     prediction_age_s = np.minimum(belief_state.peer_age_s, DEAD_RECKONING_HORIZON_S)
     predicted_peer_positions = belief_state.perceived_positions + belief_state.perceived_velocities * prediction_age_s[:, :, None]
-    pairwise_delta_xy = positions[:, None, :2] - predicted_peer_positions[:, :, :2]
-    pairwise_distance_xy = np.linalg.norm(pairwise_delta_xy, axis=2)
-    repulsion_mask = (pairwise_distance_xy < SAFE_SEPARATION_M) & (pairwise_distance_xy > 1e-6)
-    closeness = np.where(repulsion_mask, (SAFE_SEPARATION_M - pairwise_distance_xy) / SAFE_SEPARATION_M, 0.0)
-    emergency_margin = np.where(repulsion_mask, np.maximum(pairwise_distance_xy - COLLISION_RADIUS_M, 0.35), 1.0)
+    pairwise_delta = positions[:, None, :] - predicted_peer_positions[:, :, :]
+    pairwise_distance = np.linalg.norm(pairwise_delta, axis=2)
+    repulsion_mask = (pairwise_distance < SAFE_SEPARATION_M) & (pairwise_distance > 1e-6)
+    closeness = np.where(repulsion_mask, (SAFE_SEPARATION_M - pairwise_distance) / SAFE_SEPARATION_M, 0.0)
+    emergency_margin = np.where(repulsion_mask, np.maximum(pairwise_distance - COLLISION_RADIUS_M, 0.35), 1.0)
     repulsion_gain = np.where(repulsion_mask, AVOIDANCE_GAIN * (closeness + 1.0 / emergency_margin), 0.0)
-    repulsion_dir_xy = np.divide(
-        pairwise_delta_xy,
-        np.maximum(pairwise_distance_xy[:, :, None], 1e-9),
-        out=np.zeros_like(pairwise_delta_xy),
-        where=pairwise_distance_xy[:, :, None] > 1e-9,
+    repulsion_dir = np.divide(
+        pairwise_delta,
+        np.maximum(pairwise_distance[:, :, None], 1e-9),
+        out=np.zeros_like(pairwise_delta),
+        where=pairwise_distance[:, :, None] > 1e-9,
     )
-    desired_velocities[:, :2] += np.sum(repulsion_dir_xy * repulsion_gain[:, :, None], axis=1)
+    desired_velocities += np.sum(repulsion_dir * repulsion_gain[:, :, None], axis=1)
 
-    # Last-ditch close-range sensing prevents contact while leaving nominal coordination
-    # dependent on communicated peer state.
-    true_pairwise_delta_xy = positions[:, None, :2] - positions[None, :, :2]
-    true_pairwise_distance_xy = np.linalg.norm(true_pairwise_delta_xy, axis=2)
-    local_mask = (true_pairwise_distance_xy < LOCAL_PROXIMITY_THRESHOLD_M) & (true_pairwise_distance_xy > 1e-6)
+    # Last-ditch close-range sensing approximates the short-range collision sensor.
+    true_pairwise_delta = positions[:, None, :] - positions[None, :, :]
+    true_pairwise_distance = np.linalg.norm(true_pairwise_delta, axis=2)
+    local_mask = (true_pairwise_distance < LOCAL_PROXIMITY_THRESHOLD_M) & (true_pairwise_distance > 1e-6)
     local_closeness = np.where(
         local_mask,
-        (LOCAL_PROXIMITY_THRESHOLD_M - true_pairwise_distance_xy) / max(LOCAL_PROXIMITY_THRESHOLD_M - COLLISION_RADIUS_M, 1e-6),
+        (LOCAL_PROXIMITY_THRESHOLD_M - true_pairwise_distance) / max(LOCAL_PROXIMITY_THRESHOLD_M - COLLISION_RADIUS_M, 1e-6),
         0.0,
     )
-    local_margin = np.where(local_mask, np.maximum(true_pairwise_distance_xy - COLLISION_RADIUS_M, 0.20), 1.0)
+    local_margin = np.where(local_mask, np.maximum(true_pairwise_distance - COLLISION_RADIUS_M, 0.20), 1.0)
     local_repulsion_gain = np.where(local_mask, LOCAL_PROXIMITY_GAIN * (local_closeness + 1.0 / local_margin), 0.0)
-    local_repulsion_dir_xy = np.divide(
-        true_pairwise_delta_xy,
-        np.maximum(true_pairwise_distance_xy[:, :, None], 1e-9),
-        out=np.zeros_like(true_pairwise_delta_xy),
-        where=true_pairwise_distance_xy[:, :, None] > 1e-9,
+    local_repulsion_dir = np.divide(
+        true_pairwise_delta,
+        np.maximum(true_pairwise_distance[:, :, None], 1e-9),
+        out=np.zeros_like(true_pairwise_delta),
+        where=true_pairwise_distance[:, :, None] > 1e-9,
     )
-    desired_velocities[:, :2] += np.sum(local_repulsion_dir_xy * local_repulsion_gain[:, :, None], axis=1)
+    desired_velocities += np.sum(local_repulsion_dir * local_repulsion_gain[:, :, None], axis=1)
 
     velocity_error = desired_velocities - velocities
     error_magnitudes = np.linalg.norm(velocity_error, axis=1)
@@ -642,6 +721,7 @@ def simulate_hold(
     positions,
     velocities,
     belief_state,
+    swarm_link_state,
     control_bias,
     current_vector,
     center_target,
@@ -665,6 +745,7 @@ def simulate_hold(
             positions,
             velocities,
             belief_state,
+            swarm_link_state,
             control_bias,
             current_vector,
             center_target,
@@ -679,7 +760,7 @@ def simulate_hold(
         gossip_latency_sum_s += step_gossip_latency_s
         gossip_bits_sum += step_gossip_bits
         peer_age_sum += step_peer_age
-        min_sep = min(min_sep, pairwise_min_separation_xy(positions))
+        min_sep = min(min_sep, pairwise_min_separation(positions))
         if min_sep < COLLISION_RADIUS_M and collision_time is None:
             collision_time = 0.0
         if sample_store is not None and step_idx % TRACK_SAMPLE_EVERY_STEPS == 0:
@@ -703,6 +784,7 @@ def simulate_to_waypoint(
     positions,
     velocities,
     belief_state,
+    swarm_link_state,
     control_bias,
     current_vector,
     center_target,
@@ -729,6 +811,7 @@ def simulate_to_waypoint(
             positions,
             velocities,
             belief_state,
+            swarm_link_state,
             control_bias,
             current_vector,
             center_target,
@@ -747,7 +830,7 @@ def simulate_to_waypoint(
             sample_store.append(positions[:, :2].copy())
         elapsed += DT
         step_idx += 1
-        min_sep = min(min_sep, pairwise_min_separation_xy(positions))
+        min_sep = min(min_sep, pairwise_min_separation(positions))
         if min_sep < COLLISION_RADIUS_M and collision_time is None:
             collision_time = elapsed
         targets = center_target + FORMATION_OFFSETS
@@ -771,7 +854,7 @@ def simulate_to_waypoint(
     )
 
 
-def perform_command_handshake(positions, velocities, environment, mitigation, packet_profile, trial_rng):
+def perform_command_handshake(positions, velocities, environment, mitigation, packet_profile, trial_rng, operator_link_state):
     leader_idx = choose_ack_drone(positions)
     leader_pos = positions[leader_idx]
     leader_vel = velocities[leader_idx]
@@ -792,10 +875,12 @@ def perform_command_handshake(positions, velocities, environment, mitigation, pa
             mitigation,
             trial_rng,
             OPERATOR_TO_DRONE_FREQ_KHZ,
+            operator_link_state,
         )
         total_tx_count += 1
         total_latency_s += syn.latency_s
         snr_samples.append(syn.snr_db)
+        advance_transient_fade_state(operator_link_state, syn.latency_s)
         if syn.success:
             total_success_count += 1
             ack = transmit_packet(
@@ -808,21 +893,24 @@ def perform_command_handshake(positions, velocities, environment, mitigation, pa
                 mitigation,
                 trial_rng,
                 OPERATOR_TO_DRONE_FREQ_KHZ,
+                operator_link_state,
             )
             total_tx_count += 1
             total_latency_s += ack.latency_s
             snr_samples.append(ack.snr_db)
+            advance_transient_fade_state(operator_link_state, ack.latency_s)
             if ack.success:
                 total_success_count += 1
                 return HandshakeResult(True, total_latency_s, total_tx_count, total_success_count, attempt, snr_samples, leader_idx)
 
         if attempt < MAX_HANDSHAKE_ATTEMPTS - 1:
             total_latency_s += HANDSHAKE_BACKOFF_S
+            advance_transient_fade_state(operator_link_state, HANDSHAKE_BACKOFF_S)
 
     return HandshakeResult(False, total_latency_s, total_tx_count, total_success_count, MAX_HANDSHAKE_ATTEMPTS - 1, snr_samples, leader_idx)
 
 
-def perform_arrival_handshake(positions, velocities, environment, mitigation, packet_profile, trial_rng):
+def perform_arrival_handshake(positions, velocities, environment, mitigation, packet_profile, trial_rng, operator_link_state):
     leader_idx = choose_ack_drone(positions)
     leader_pos = positions[leader_idx]
     leader_vel = velocities[leader_idx]
@@ -843,10 +931,12 @@ def perform_arrival_handshake(positions, velocities, environment, mitigation, pa
             mitigation,
             trial_rng,
             OPERATOR_TO_DRONE_FREQ_KHZ,
+            operator_link_state,
         )
         total_tx_count += 1
         total_latency_s += syn.latency_s
         snr_samples.append(syn.snr_db)
+        advance_transient_fade_state(operator_link_state, syn.latency_s)
         if syn.success:
             total_success_count += 1
             ack = transmit_packet(
@@ -859,16 +949,19 @@ def perform_arrival_handshake(positions, velocities, environment, mitigation, pa
                 mitigation,
                 trial_rng,
                 OPERATOR_TO_DRONE_FREQ_KHZ,
+                operator_link_state,
             )
             total_tx_count += 1
             total_latency_s += ack.latency_s
             snr_samples.append(ack.snr_db)
+            advance_transient_fade_state(operator_link_state, ack.latency_s)
             if ack.success:
                 total_success_count += 1
                 return HandshakeResult(True, total_latency_s, total_tx_count, total_success_count, attempt, snr_samples, leader_idx)
 
         if attempt < MAX_HANDSHAKE_ATTEMPTS - 1:
             total_latency_s += HANDSHAKE_BACKOFF_S
+            advance_transient_fade_state(operator_link_state, HANDSHAKE_BACKOFF_S)
 
     return HandshakeResult(False, total_latency_s, total_tx_count, total_success_count, MAX_HANDSHAKE_ATTEMPTS - 1, snr_samples, leader_idx)
 
@@ -877,6 +970,7 @@ def run_collision_trial(trial_seed, mitigation, packet_profile, store_track=True
     trial_rng = np.random.default_rng(trial_seed)
     positions, velocities, control_bias = init_fleet(trial_rng, start_center=COLLISION_START_CENTER)
     belief_state = init_swarm_belief_state(positions, velocities)
+    swarm_link_state = TransientFadeState()
     current_vector = sample_current(COLLISION_ENVIRONMENT, trial_rng)
     target_idx = 1
     min_sep = float("inf")
@@ -896,6 +990,7 @@ def run_collision_trial(trial_seed, mitigation, packet_profile, store_track=True
             positions,
             velocities,
             belief_state,
+            swarm_link_state,
             control_bias,
             current_vector,
             center_target,
@@ -913,7 +1008,7 @@ def run_collision_trial(trial_seed, mitigation, packet_profile, store_track=True
         if track_samples is not None and step % TRACK_SAMPLE_EVERY_STEPS == 0:
             track_samples.append(positions[:, :2].copy())
 
-        min_sep = min(min_sep, pairwise_min_separation_xy(positions))
+        min_sep = min(min_sep, pairwise_min_separation(positions))
         if min_sep < COLLISION_RADIUS_M and collision_time_s is None:
             collision_time_s = step * DT
 
@@ -937,6 +1032,8 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
     trial_rng = np.random.default_rng(trial_seed)
     positions, velocities, control_bias = init_fleet(trial_rng)
     belief_state = init_swarm_belief_state(positions, velocities)
+    swarm_link_state = TransientFadeState()
+    operator_link_state = TransientFadeState()
     mission_environment = AcousticEnvironment(
         name=MISSION_ENVIRONMENT.name,
         water_depth_m=MISSION_ENVIRONMENT.water_depth_m,
@@ -971,54 +1068,117 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
     peer_age_steps = 0
 
     completed_waypoints = 0
+    previous_arrival_confirmed = True
 
     for waypoint_center in MISSION_WAYPOINT_CENTERS:
-        handshake = perform_command_handshake(positions, velocities, mission_environment, mitigation, packet_profile, trial_rng)
-        chosen_leaders.append(handshake.leader_idx)
-        retries_per_waypoint.append(handshake.retries)
-        command_tx += handshake.packet_tx_count
-        command_successes += handshake.packet_success_count
-        command_latencies_ms.append(handshake.latency_s * MS_PER_SECOND)
-        snr_samples.extend(handshake.snr_samples)
+        retries_per_waypoint.append(0)
+        command_wait_s = 0.0 if completed_waypoints == 0 or previous_arrival_confirmed else COMMAND_REQUEST_INTERVAL_S
+        command_acquired = False
 
-        (
-            positions,
-            velocities,
-            min_sep,
-            collision_during_hold,
-            hold_elapsed,
-            hold_tx_count,
-            hold_success_count,
-            hold_gossip_latency_sum_s,
-            hold_gossip_bits_sum,
-            hold_peer_age_sum,
-            hold_steps,
-        ) = simulate_hold(
-            positions,
-            velocities,
-            belief_state,
-            control_bias,
-            current_vector,
-            current_center,
-            mission_environment,
-            mitigation,
-            packet_profile.packet_bytes,
-            handshake.latency_s,
-            trial_rng,
-            track_samples,
-            min_sep,
-        )
-        gossip_tx_count += hold_tx_count
-        gossip_success_count += hold_success_count
-        gossip_latency_sum_s += hold_gossip_latency_sum_s
-        gossip_bits_sum += hold_gossip_bits_sum
-        peer_age_sum += hold_peer_age_sum
-        peer_age_steps += hold_steps
-        total_time_s += hold_elapsed
-        if collision_during_hold is not None:
-            collision_free = False
+        while total_time_s < MISSION_TIMEOUT_S:
+            if command_wait_s > 0.0:
+                (
+                    positions,
+                    velocities,
+                    min_sep,
+                    collision_during_hold,
+                    hold_elapsed,
+                    hold_tx_count,
+                    hold_success_count,
+                    hold_gossip_latency_sum_s,
+                    hold_gossip_bits_sum,
+                    hold_peer_age_sum,
+                    hold_steps,
+                ) = simulate_hold(
+                    positions,
+                    velocities,
+                    belief_state,
+                    swarm_link_state,
+                    control_bias,
+                    current_vector,
+                    current_center,
+                    mission_environment,
+                    mitigation,
+                    packet_profile.packet_bytes,
+                    min(command_wait_s, MISSION_TIMEOUT_S - total_time_s),
+                    trial_rng,
+                    track_samples,
+                    min_sep,
+                )
+                gossip_tx_count += hold_tx_count
+                gossip_success_count += hold_success_count
+                gossip_latency_sum_s += hold_gossip_latency_sum_s
+                gossip_bits_sum += hold_gossip_bits_sum
+                peer_age_sum += hold_peer_age_sum
+                peer_age_steps += hold_steps
+                total_time_s += hold_elapsed
+                advance_transient_fade_state(operator_link_state, hold_elapsed)
+                if collision_during_hold is not None:
+                    collision_free = False
+                if total_time_s >= MISSION_TIMEOUT_S:
+                    break
 
-        if not handshake.success or total_time_s >= MISSION_TIMEOUT_S:
+            handshake = perform_command_handshake(
+                positions,
+                velocities,
+                mission_environment,
+                mitigation,
+                packet_profile,
+                trial_rng,
+                operator_link_state,
+            )
+            chosen_leaders.append(handshake.leader_idx)
+            retries_per_waypoint[-1] += handshake.retries
+            command_tx += handshake.packet_tx_count
+            command_successes += handshake.packet_success_count
+            command_latencies_ms.append(handshake.latency_s * MS_PER_SECOND)
+            snr_samples.extend(handshake.snr_samples)
+
+            (
+                positions,
+                velocities,
+                min_sep,
+                collision_during_hold,
+                hold_elapsed,
+                hold_tx_count,
+                hold_success_count,
+                hold_gossip_latency_sum_s,
+                hold_gossip_bits_sum,
+                hold_peer_age_sum,
+                hold_steps,
+            ) = simulate_hold(
+                positions,
+                velocities,
+                belief_state,
+                swarm_link_state,
+                control_bias,
+                current_vector,
+                current_center,
+                mission_environment,
+                mitigation,
+                packet_profile.packet_bytes,
+                handshake.latency_s,
+                trial_rng,
+                track_samples,
+                min_sep,
+            )
+            gossip_tx_count += hold_tx_count
+            gossip_success_count += hold_success_count
+            gossip_latency_sum_s += hold_gossip_latency_sum_s
+            gossip_bits_sum += hold_gossip_bits_sum
+            peer_age_sum += hold_peer_age_sum
+            peer_age_steps += hold_steps
+            total_time_s += hold_elapsed
+            if collision_during_hold is not None:
+                collision_free = False
+
+            if handshake.success:
+                command_acquired = True
+                break
+
+            command_wait_s = COMMAND_REQUEST_INTERVAL_S
+
+        if not command_acquired or total_time_s >= MISSION_TIMEOUT_S:
             break
 
         (
@@ -1038,6 +1198,7 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
             positions,
             velocities,
             belief_state,
+            swarm_link_state,
             control_bias,
             current_vector,
             waypoint_center,
@@ -1056,6 +1217,7 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
         peer_age_sum += travel_peer_age_sum
         peer_age_steps += travel_steps
         total_time_s += travel_elapsed
+        advance_transient_fade_state(operator_link_state, travel_elapsed)
         if collision_during_travel is not None:
             collision_free = False
 
@@ -1063,7 +1225,16 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
             break
 
         current_center = waypoint_center
-        arrival = perform_arrival_handshake(positions, velocities, mission_environment, mitigation, packet_profile, trial_rng)
+        completed_waypoints += 1
+        arrival = perform_arrival_handshake(
+            positions,
+            velocities,
+            mission_environment,
+            mitigation,
+            packet_profile,
+            trial_rng,
+            operator_link_state,
+        )
         chosen_leaders.append(arrival.leader_idx)
         retries_per_waypoint[-1] += arrival.retries
         arrival_tx += arrival.packet_tx_count
@@ -1087,6 +1258,7 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
             positions,
             velocities,
             belief_state,
+            swarm_link_state,
             control_bias,
             current_vector,
             current_center,
@@ -1108,10 +1280,7 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
         if collision_during_hold is not None:
             collision_free = False
 
-        if not arrival.success or total_time_s >= MISSION_TIMEOUT_S:
-            break
-
-        completed_waypoints += 1
+        previous_arrival_confirmed = arrival.success
 
     success = completed_waypoints == len(MISSION_WAYPOINT_CENTERS) and collision_free
     command_loss_rate = 1.0 - (command_successes / max(command_tx, 1))

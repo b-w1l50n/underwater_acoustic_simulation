@@ -37,13 +37,14 @@ The simulator focuses on two experiments:
 - Simple surface and bottom multipath penalty.
 - Doppler penalty based on radial relative motion.
 - Log-normal shadowing.
-- Occasional wideband bad fades.
+- Temporary burst-fade states that make nearby packets statistically more likely to experience extra fading for a few seconds.
 - Narrowband fades that make hopping and frequency diversity matter.
 - Packet airtime and latency from propagation plus transmit time.
 - Different airtime on the operator and swarm links because the modem rates are different.
 - Packet error probability from an SNR -> BER -> PER approximation.
 - Parallel frequency-diverse packet copies for the mitigated case.
 - Stop-and-wait command / arrival handshakes with retries and backoff.
+- A `15 s` command-request behavior so the fleet asks for a fresh command if one is not received.
 - Swarm control that depends on communicated peer state rather than perfect knowledge.
 - Dead reckoning on stale peer state using last received velocity and message age.
 - Monte Carlo averaging, confidence intervals, and percentile bands.
@@ -54,7 +55,7 @@ This is not a waveform-level modem simulation and not a full underwater network 
 
 The main simplifications are:
 
-- Collision logic is mostly 2D in `x/y`; depth is carried but not used in the pairwise separation metric.
+- Track plots are shown in `x/y`, but collision checks and close-range sensing now use full 3D separation.
 - The water column is uniform; there is no sound-speed profile, refraction, thermocline, or temperature-gradient model.
 - Currents are sampled once per trial and treated as spatially uniform.
 - Drone-to-drone gossip uses a compact access-loss model rather than a detailed MAC with queues and scheduling.
@@ -62,16 +63,19 @@ The main simplifications are:
 - A close-range local sensing layer still exists as a last-ditch safety term.
 - The operator mission uses one selected representative drone for each handshake rather than a richer fleet command protocol.
 - Obstruction / shadowing by one vehicle physically blocking another is not explicitly modeled.
+- Fade correlation is modeled with a lightweight temporary-bias state rather than a full channel-state Markov process.
 
 ## Current Collision-Safety Interpretation
 
-The collision threshold in the simulator is `8 m`.
+The collision threshold in the simulator is `1 m`.
 
-The nominal formation is a compact cross around the center waypoint path, and the swarm controller tries to:
+The nominal formation is a compact cross with about `7 m` stand-off from the center vehicle to each side vehicle, so the controller is trying to keep neighbors in roughly the `6-8 m` band.
 
-- stay in formation
-- avoid each other using communicated peer state
-- fall back to a close-range local repulsion term if needed
+Each drone also has a last-ditch local sensing layer with a `5 m` proximity range. The swarm controller therefore tries to:
+
+- stay in formation near the `6-8 m` target spacing
+- avoid each other using communicated and dead-reckoned peer state inside the broader stand-off zone
+- fall back to short-range local sensing inside `5 m`
 
 The collision-endurance patrol uses a gentler loiter path than the operator mission. That is intentional. It is meant to test whether the swarm can remain coherent and avoid collisions over long duration, not whether it can survive the sharpest possible turns for six hours straight.
 
@@ -92,6 +96,13 @@ Instead, the simulator does this:
 - Redundancy sends simultaneous copies on that active hop pair.
 - A logical packet succeeds if either copy gets through.
 - Packet latency is the earliest successful copy, not the sum of multiple copies.
+
+Transient fading also has short memory:
+
+- each packet gets the usual per-packet fade draw
+- a separate low-probability roll can put the link into a temporary degraded state
+- while degraded, subsequent packets are biased toward extra fading for roughly `2-5 s`
+- after that, the link enters a cooldown window before another temporary burst can start
 
 Current hop-pair sets are:
 
@@ -152,6 +163,8 @@ Sequence per waypoint:
 - one drone is chosen to send arrival SYN
 - operator sends ACK back
 - next waypoint begins
+
+If the fleet does not receive a command for `15 s`, it asks for a command again instead of treating one failed packet as immediate mission failure.
 
 Key outputs:
 
