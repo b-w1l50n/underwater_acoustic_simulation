@@ -181,6 +181,16 @@ class HandshakeResult:
 
 
 @dataclass
+class RequestResult:
+    success: bool
+    latency_s: float
+    packet_tx_count: int
+    packet_success_count: int
+    snr_samples: list
+    leader_idx: int
+
+
+@dataclass
 class CollisionTrialResult:
     trial_seed: int
     collision_free: bool
@@ -966,6 +976,33 @@ def perform_arrival_handshake(positions, velocities, environment, mitigation, pa
     return HandshakeResult(False, total_latency_s, total_tx_count, total_success_count, MAX_HANDSHAKE_ATTEMPTS - 1, snr_samples, leader_idx)
 
 
+def perform_command_request(positions, velocities, environment, mitigation, packet_profile, trial_rng, operator_link_state):
+    leader_idx = choose_ack_drone(positions)
+    leader_pos = positions[leader_idx]
+    leader_vel = velocities[leader_idx]
+    request_packet = transmit_packet(
+        leader_pos,
+        OPERATOR_POS,
+        leader_vel,
+        np.zeros(3),
+        packet_profile.packet_bytes,
+        environment,
+        mitigation,
+        trial_rng,
+        OPERATOR_TO_DRONE_FREQ_KHZ,
+        operator_link_state,
+    )
+    advance_transient_fade_state(operator_link_state, request_packet.latency_s)
+    return RequestResult(
+        success=request_packet.success,
+        latency_s=request_packet.latency_s,
+        packet_tx_count=1,
+        packet_success_count=int(request_packet.success),
+        snr_samples=[request_packet.snr_db],
+        leader_idx=leader_idx,
+    )
+
+
 def run_collision_trial(trial_seed, mitigation, packet_profile, store_track=True):
     trial_rng = np.random.default_rng(trial_seed)
     positions, velocities, control_bias = init_fleet(trial_rng, start_center=COLLISION_START_CENTER)
@@ -1072,11 +1109,11 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
 
     for waypoint_center in MISSION_WAYPOINT_CENTERS:
         retries_per_waypoint.append(0)
-        command_wait_s = 0.0 if completed_waypoints == 0 or previous_arrival_confirmed else COMMAND_REQUEST_INTERVAL_S
         command_acquired = False
+        awaiting_requested_retry = not (completed_waypoints == 0 or previous_arrival_confirmed)
 
         while total_time_s < MISSION_TIMEOUT_S:
-            if command_wait_s > 0.0:
+            if awaiting_requested_retry:
                 (
                     positions,
                     velocities,
@@ -1100,7 +1137,7 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
                     mission_environment,
                     mitigation,
                     packet_profile.packet_bytes,
-                    min(command_wait_s, MISSION_TIMEOUT_S - total_time_s),
+                    min(COMMAND_REQUEST_INTERVAL_S, MISSION_TIMEOUT_S - total_time_s),
                     trial_rng,
                     track_samples,
                     min_sep,
@@ -1117,6 +1154,62 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
                     collision_free = False
                 if total_time_s >= MISSION_TIMEOUT_S:
                     break
+
+                request = perform_command_request(
+                    positions,
+                    velocities,
+                    mission_environment,
+                    mitigation,
+                    packet_profile,
+                    trial_rng,
+                    operator_link_state,
+                )
+                chosen_leaders.append(request.leader_idx)
+                command_tx += request.packet_tx_count
+                command_successes += request.packet_success_count
+                snr_samples.extend(request.snr_samples)
+
+                (
+                    positions,
+                    velocities,
+                    min_sep,
+                    collision_during_hold,
+                    hold_elapsed,
+                    hold_tx_count,
+                    hold_success_count,
+                    hold_gossip_latency_sum_s,
+                    hold_gossip_bits_sum,
+                    hold_peer_age_sum,
+                    hold_steps,
+                ) = simulate_hold(
+                    positions,
+                    velocities,
+                    belief_state,
+                    swarm_link_state,
+                    control_bias,
+                    current_vector,
+                    current_center,
+                    mission_environment,
+                    mitigation,
+                    packet_profile.packet_bytes,
+                    request.latency_s,
+                    trial_rng,
+                    track_samples,
+                    min_sep,
+                )
+                gossip_tx_count += hold_tx_count
+                gossip_success_count += hold_success_count
+                gossip_latency_sum_s += hold_gossip_latency_sum_s
+                gossip_bits_sum += hold_gossip_bits_sum
+                peer_age_sum += hold_peer_age_sum
+                peer_age_steps += hold_steps
+                total_time_s += hold_elapsed
+                if collision_during_hold is not None:
+                    collision_free = False
+                if total_time_s >= MISSION_TIMEOUT_S:
+                    break
+                if not request.success:
+                    continue
 
             handshake = perform_command_handshake(
                 positions,
@@ -1176,7 +1269,7 @@ def run_mission_trial(trial_seed, mitigation, packet_profile, store_track=True):
                 command_acquired = True
                 break
 
-            command_wait_s = COMMAND_REQUEST_INTERVAL_S
+            awaiting_requested_retry = True
 
         if not command_acquired or total_time_s >= MISSION_TIMEOUT_S:
             break

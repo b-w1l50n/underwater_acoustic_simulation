@@ -44,7 +44,7 @@ The simulator focuses on two experiments:
 - Packet error probability from an SNR -> BER -> PER approximation.
 - Parallel frequency-diverse packet copies for the mitigated case.
 - Stop-and-wait command / arrival handshakes with retries and backoff.
-- A `15 s` command-request behavior so the fleet asks for a fresh command if one is not received.
+- A `15 s` silence watchdog so the fleet sends an explicit command-request ping if it does not hear the next operator SYN in time.
 - Swarm control that depends on communicated peer state rather than perfect knowledge.
 - Dead reckoning on stale peer state using last received velocity and message age.
 - Monte Carlo averaging, confidence intervals, and percentile bands.
@@ -164,7 +164,7 @@ Sequence per waypoint:
 - operator sends ACK back
 - next waypoint begins
 
-If the fleet does not receive a command for `15 s`, it asks for a command again instead of treating one failed packet as immediate mission failure.
+If the fleet does not hear the next operator SYN within `15 s`, it sends a command-request ping and retries command acquisition instead of treating one failed packet as immediate mission failure.
 
 Key outputs:
 
